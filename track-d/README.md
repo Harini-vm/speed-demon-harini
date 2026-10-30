@@ -14,7 +14,7 @@ Rust, standard library only, in `src/main.rs`. The work splits into building a c
    - forward from `s` and backward from `t`, always growing the side with fewer queued entries. Growing by the smaller key would let the backward side flood the graph when `s` starts with an edge of weight near 2^32;
    - it stops when the two next keys add up to at least the best path seen;
    - the priority queue is a radix heap (Dijkstra's keys never decrease), which beat a binary heap by about a third;
-   - distances are u32, stored as distance + 1 in zero-allocated arrays, so only the pages a thread's searches touch are committed. A query whose distances would leave u32 (the paths over near-2^32 edges) is re-run by a small 64-bit Dijkstra.
+   - distances are u32, stored as distance + 1 in 1 KB pages from a per-thread pool: a 256-node block gets a page when the search first reaches it, and every page goes back to the pool when the search ends, so memory follows the largest single search rather than the whole graph. A query whose distances would leave u32 (the paths over near-2^32 edges) is re-run by a small 64-bit Dijkstra.
 6. **Work split.** Queries are sorted by source and handed out in contiguous runs, two per thread, so each thread searches one region of the renumbered map and keeps it in cache.
 7. **Memory.** Every allocation of 128 KiB or more goes to its own mmap (`mallopt`), so the parse buckets and the first copy of the graph go back to the OS when freed instead of staying in glibc's per-thread arenas.
 

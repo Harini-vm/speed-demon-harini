@@ -149,8 +149,14 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     let nb = (n >> SHIFT) + 1;
     // Parse straight into buckets by tail; self-loops never shorten a path, so drop them.
     let parts = par_map(split_lines(&text[i..], threads), |chunk| {
-        let expect = chunk.len() / 18 / nb; // ~18 bytes per edge line
-        let mut buckets = vec![Vec::with_capacity(expect + expect / 4 + 16); nb];
+        // Every bucket gets its own capacity (`vec![v; nb]` would clone empty ones), about
+        // 18 bytes of input per edge line: at full scale each is then above the mmap
+        // threshold, so freeing it returns the memory instead of leaving it in this
+        // thread's malloc arena.
+        let expect = chunk.len() / 18 / nb;
+        let mut buckets: Vec<Vec<[u32; 3]>> = (0..nb)
+            .map(|_| Vec::with_capacity(expect + expect / 4 + 16))
+            .collect();
         let mut j = 0;
         while j < chunk.len() {
             let [u, v, w] = [0; 3].map(|_| number_fast(chunk, &mut j) as u32);
@@ -350,12 +356,21 @@ fn reverse(g: &Graph, threads: usize) -> Graph {
     Graph { off, adj }
 }
 
-/// One direction of a search. `dist` holds distance + 1, with 0 for "not reached": it is
-/// allocated zeroed, so only the pages a thread's searches actually touch are committed,
-/// and u32 halves it. A distance that would not fit sets `wide`; the query is then re-run
-/// by `shortest_wide`. Only paths over edges of weight near 2^32 get there.
+/// Node v's distance lives on page `v >> PAGE_BITS` of a small pool, so a search uses
+/// memory for the pages its nodes fall on, not for the whole graph.
+const PAGE_BITS: usize = 8;
+const PAGE: usize = 1 << PAGE_BITS;
+
+/// One direction of a search. `dist` holds distance + 1, with 0 for "not reached", in pages
+/// handed out on first write: `table[v >> PAGE_BITS]` is the page's place in `pages`, and
+/// page 0 is all zeros, standing in for every page not yet handed out. After the BFS
+/// renumbering a search touches few pages, so the pool stays small, and resetting the
+/// touched entries leaves every page zeroed for the next query. u32 distances: one that
+/// would not fit sets `wide`, and the query is re-run by `shortest_wide`.
 struct Side {
-    dist: Vec<u32>,
+    table: Vec<u32>,
+    pages: Vec<u32>,
+    used: usize,
     touched: Vec<u32>,
     heap: RadixHeap,
 }
@@ -363,32 +378,59 @@ struct Side {
 impl Side {
     fn new(n: usize) -> Self {
         Side {
-            dist: vec![0; n],
+            table: vec![0; (n >> PAGE_BITS) + 1],
+            pages: vec![0; PAGE],
+            used: 1,
             touched: Vec::new(),
             heap: RadixHeap::new(),
         }
     }
 
+    #[inline(always)]
+    fn dist(&self, v: u32) -> u32 {
+        let v = v as usize;
+        self.pages[(self.table[v >> PAGE_BITS] as usize) << PAGE_BITS | (v & (PAGE - 1))]
+    }
+
+    #[inline(always)]
+    fn slot(&mut self, v: u32) -> &mut u32 {
+        let v = v as usize;
+        let page = &mut self.table[v >> PAGE_BITS];
+        if *page == 0 {
+            *page = self.used as u32;
+            self.used += 1;
+            if self.pages.len() < self.used << PAGE_BITS {
+                self.pages.resize(self.used << PAGE_BITS, 0);
+            }
+        }
+        &mut self.pages[(*page as usize) << PAGE_BITS | (v & (PAGE - 1))]
+    }
+
     fn start(&mut self, x: u32) {
-        self.dist[x as usize] = 1;
+        *self.slot(x) = 1;
         self.touched.push(x);
         self.heap.push(0, x);
     }
 
     fn reset(&mut self) {
         for &v in &self.touched {
-            self.dist[v as usize] = 0;
+            let page = self.table[v as usize >> PAGE_BITS] as usize;
+            self.pages[page << PAGE_BITS | (v as usize & (PAGE - 1))] = 0;
+        }
+        for &v in &self.touched {
+            self.table[v as usize >> PAGE_BITS] = 0;
         }
         self.touched.clear();
         self.heap.clear();
+        self.used = 1;
     }
 
     /// Settles one node and relaxes its edges in `g`. Every relaxed edge that reaches a
     /// node the other side has labelled is a complete s-t path; `best` keeps the shortest.
-    fn step(&mut self, g: &Graph, other: &[u32], best: &mut u64, wide: &mut bool) {
+    fn step(&mut self, g: &Graph, other: &Side, best: &mut u64, wide: &mut bool) {
         let (d, u) = self.heap.pop().unwrap();
         let d = u64::from(d);
-        if d + 1 > u64::from(self.dist[u as usize]) {
+        if d + 1 > u64::from(self.dist(u)) {
             return; // stale entry
         }
         for &(v, w) in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize] {
@@ -397,16 +439,17 @@ impl Side {
                 *wide = true;
                 continue;
             }
-            let o = other[v as usize];
+            let o = other.dist(v);
             if o != 0 {
                 *best = (*best).min(nd + u64::from(o) - 1);
             }
-            let dv = &mut self.dist[v as usize];
+            let dv = self.slot(v);
             if *dv == 0 || nd + 1 < u64::from(*dv) {
-                if *dv == 0 {
+                let new = *dv == 0;
+                *dv = nd as u32 + 1;
+                if new {
                     self.touched.push(v);
                 }
-                *dv = nd as u32 + 1;
                 self.heap.push(nd as u32, v);
             }
         }
@@ -433,9 +476,9 @@ fn shortest(
             break;
         }
         if f.heap.len <= b.heap.len {
-            f.step(g, &b.dist, &mut best, &mut wide);
+            f.step(g, b, &mut best, &mut wide);
         } else {
-            b.step(r, &f.dist, &mut best, &mut wide);
+            b.step(r, f, &mut best, &mut wide);
         }
     }
     f.reset();
@@ -481,7 +524,6 @@ fn main() {
         build_graph(map(&format!("{data_dir}/graph.txt")), threads),
         threads,
     );
-    let rev = reverse(&g, threads);
     let qtext = map(&format!("{data_dir}/queries.txt"));
     let mut queries = Vec::new();
     let mut i = 0;
@@ -489,6 +531,8 @@ fn main() {
         let s = new_id[number(qtext, &mut i) as usize];
         queries.push((s, new_id[number(qtext, &mut i) as usize]));
     }
+    drop(new_id);
+    let rev = reverse(&g, threads);
 
     // Queries sorted by source and handed out in contiguous runs (two per thread): after
     // the renumbering, each thread then searches one part of the map, so it touches only

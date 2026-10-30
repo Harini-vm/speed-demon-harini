@@ -7,7 +7,8 @@ Every step from the reference to the final version, each with the live-board run
 | 0 | The reference, unchanged (scoring-box calibration) | | 72.69 | 893 | 43 | 1 | 0 |
 | 1 | Rust: bucketed CSR, BFS renumbering, bidirectional Dijkstra with a radix heap, u32 distances | `155b431` | 0.252 | 203 | 435 | 16.12 | 60.373 |
 | 2 | SWAR number parsing, u32 heap keys, parallel renumbering bookkeeping | `5e6ffc1` | 0.236 | 199 | 482 | 16.50 | 60.873 |
-| 3 | Smaller source: the same logic in fewer lines | _fill in_ | | | | | |
+| 3 | Smaller source: the same logic in fewer lines | `e5a377e` | 0.230 | 202 | 436 | 16.90 | 61.394 |
+| 4 | Distances in a small page pool; parse buckets that free back to the OS | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -58,3 +59,18 @@ Source size is 15% of the exponent, and this file was 473 code lines against the
 `par_map` for the seven parallel sections, and a `SharedPtr::set` method so each disjoint write is one line. Parsing reads `u v w` with one array expression, and the bidirectional search takes its two sides as one pair.
 
 473 to 427 code lines. Run time unchanged in alternating runs against the previous build. Correctness: identical SHA-256 to the reference on the full seed battery, the worked example, and with 1, 3 and 13 threads.
+
+Board, step 3: 482 to 436 lines, and T 236 to 230 ms.
+
+## Step 4: memory
+
+The board's M was 202 MB against about 101 MB of graphs (forward and reverse, 47 MB each, plus the renumbering map). Snapshots between phases never showed more than 131 MB, so I sampled the process's anonymous memory every millisecond instead, with a copy forced to 12 threads. The peak was 192 MB, and it came from two places.
+
+1. **Malloc arenas.** The parse buckets were built with `vec![Vec::with_capacity(c); nb]`, which clones the vector, and a clone does not keep the capacity. So all buckets but one started empty and doubled their way up, and every step below the 128 KB mmap threshold left a freed chunk in that thread's malloc arena. Freeing the buckets returned the large chunks to the OS but not those: about 35 MB stayed resident for the rest of the run. Now every bucket gets its capacity up front, so at full scale each one is mmap-backed from the start.
+2. **Distance arrays.** Each thread had two arrays of 1.74 million entries (7 MB each) for the two sides of the search. Pages were committed only when touched, but they stayed committed, so over a run each thread's arrays filled up with the union of every search's pages: about 65 MB across 24 arrays. Now distances live in 1 KB pages from a per-thread pool. A small table maps each 256-node block to its page, and blocks with no page point at an all-zero page, so a read needs no branch. A search takes pages from the pool as it reaches new blocks and hands them all back when it ends. Its touched entries are cleared anyway, so every page is zero for the next search. Each side now needs only the pages of its largest search, about 0.5 MB.
+
+The renumbering map is also dropped once the queries are translated, before the reverse graph is built.
+
+Peak anonymous memory at 12 threads: 192 MB to 105 MB. It was also faster locally: 786 to 702 ms (2 threads, min of 9, alternating runs). The page table fits in L1 and the pool in L2, where the old arrays sent most reads to memory.
+
+459 code lines (from 427). Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, and with 1, 3 and 13 threads.
