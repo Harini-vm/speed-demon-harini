@@ -38,6 +38,8 @@ fn map(path: &str) -> &'static [u8] {
 
 /// Documents per batch: local ids fit in u16, and a batch's index stays small.
 const BATCH: usize = 4096;
+/// A (bool term, local doc) pair packs into one u32: the doc takes the low SHIFT bits.
+const SHIFT: u32 = BATCH.trailing_zeros();
 const NONE: u32 = u32::MAX;
 
 /// Spec 2.2 as a table: the lowercase byte for [A-Za-z0-9], 0 for every separator.
@@ -100,23 +102,44 @@ fn token_words(buf: &[u8], start: usize, len: usize) -> Words {
     w
 }
 
-/// The query vocabulary: term -> dense id. Each slot holds the top 32 bits of the term's
-/// hash and its id; keys are stored as words, so a lookup compares four u64s.
-struct Terms {
-    slots: Vec<u64>, // hash tag | id + 1; 0 = empty
-    keys: Vec<(Words, usize)>,
+/// One query term: its key, and what the scan needs to know about it, in one record so a
+/// hit costs one cache line.
+#[derive(Clone, Copy)]
+struct Term {
+    words: Words,
+    len: usize,
+    bool_index: u32, // dense index among BOOL terms, or NONE
+    in_phrase: bool,
 }
+
+/// The query vocabulary: term -> dense id. Each slot holds the top 32 bits of the term's
+/// hash and its id, and keys are compared as four u64s. In front of the table sits a
+/// 256 KB filter with one bit per hash value: about a fifth of corpus tokens are not query
+/// terms, and a clear bit turns them away without probing a cold slot.
+struct Terms {
+    filter: Vec<u64>,
+    slots: Vec<u64>, // hash tag | id + 1; 0 = empty
+    keys: Vec<Term>,
+}
+
+const FILTER_BITS: u32 = 21;
 
 impl Terms {
     fn new() -> Self {
         Terms {
+            filter: vec![0; 1 << (FILTER_BITS - 6)],
             slots: vec![0; 1 << 18],
             keys: Vec::new(),
         }
     }
 
+    #[inline(always)]
     fn get(&self, w: &Words, len: usize) -> u32 {
         let h = hash(w, len);
+        let f = (h >> (64 - FILTER_BITS)) as usize;
+        if self.filter[f / 64] & (1 << (f % 64)) == 0 {
+            return NONE;
+        }
         let (mask, tag) = (self.slots.len() - 1, h & !0xFFFF_FFFF);
         let mut s = h as usize & mask;
         loop {
@@ -125,7 +148,7 @@ impl Terms {
                 return NONE;
             }
             let id = (e & 0xFFFF_FFFF) as usize - 1;
-            if e & !0xFFFF_FFFF == tag && self.keys[id].1 == len && self.keys[id].0 == *w {
+            if e & !0xFFFF_FFFF == tag && self.keys[id].len == len && self.keys[id].words == *w {
                 return id as u32;
             }
             s = (s + 1) & mask;
@@ -144,11 +167,18 @@ impl Terms {
             "too many query terms"
         );
         let h = hash(&w, t.len());
+        let f = (h >> (64 - FILTER_BITS)) as usize;
+        self.filter[f / 64] |= 1 << (f % 64);
         let mut s = h as usize & (self.slots.len() - 1);
         while self.slots[s] != 0 {
             s = (s + 1) & (self.slots.len() - 1);
         }
-        self.keys.push((w, t.len()));
+        self.keys.push(Term {
+            words: w,
+            len: t.len(),
+            bool_index: NONE,
+            in_phrase: false,
+        });
         self.slots[s] = (h & !0xFFFF_FFFF) | self.keys.len() as u64;
         self.keys.len() as u32 - 1
     }
@@ -202,8 +232,12 @@ fn class_mask_tail(buf: &[u8], i: usize) -> u64 {
 
 /// Aho-Corasick over term ids: reports every distinct phrase that ends at a position.
 struct Automaton {
-    root: Vec<u32>,        // the start state's transitions, dense by term id (0 = none)
-    goto: Vec<(u64, u32)>, // other transitions: (state << 32 | term, next), open addressing
+    root: Vec<u32>, // the start state's transitions, dense by term id (0 = none)
+    /// Other states' transitions: edges[edge_start[s]..edge_start[s + 1]] are state s's
+    /// (term, next) pairs sorted by term. Most states have one to three, so a lookup reads
+    /// one cache line instead of probing a large hash table.
+    edge_start: Vec<u32>,
+    edges: Vec<(u32, u32)>,
     fail: Vec<u32>,
     /// Per state: the phrase ending exactly here (or NONE), and the nearest state on the
     /// fail chain that ends a phrase (or NONE).
@@ -211,16 +245,13 @@ struct Automaton {
 }
 
 impl Automaton {
+    #[inline(always)]
     fn edge(&self, s: u32, t: u32) -> u32 {
-        let key = u64::from(s) << 32 | u64::from(t);
-        let mask = self.goto.len() - 1;
-        let mut i = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & mask;
-        loop {
-            match self.goto[i] {
-                (u64::MAX, _) => return NONE,
-                (k, n) if k == key => return n,
-                _ => i = (i + 1) & mask,
-            }
+        let e = &self.edges
+            [self.edge_start[s as usize] as usize..self.edge_start[s as usize + 1] as usize];
+        match e.binary_search_by_key(&t, |x| x.0) {
+            Ok(i) => e[i].1,
+            Err(_) => NONE,
         }
     }
 
@@ -259,25 +290,20 @@ impl Automaton {
             pattern[s] = p as u32;
         }
         let n = children.len();
-        let size = (n * 2).next_power_of_two().max(2);
         let mut a = Automaton {
             root: vec![0; n_terms],
-            goto: vec![(u64::MAX, 0); size],
+            edge_start: vec![0; n + 1],
+            edges: Vec::new(),
             fail: vec![0; n],
             out: pattern.iter().map(|&p| (p, NONE)).collect(),
         };
         for &(t, c) in &children[0] {
             a.root[t as usize] = c;
         }
-        for (s, cs) in children.iter().enumerate().skip(1) {
-            for &(t, c) in cs {
-                let key = (s as u64) << 32 | u64::from(t);
-                let mut i = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) as usize & (size - 1);
-                while a.goto[i].0 != u64::MAX {
-                    i = (i + 1) & (size - 1);
-                }
-                a.goto[i] = (key, c);
-            }
+        for (s, cs) in children.iter_mut().enumerate().skip(1) {
+            cs.sort_unstable();
+            a.edges.extend_from_slice(cs);
+            a.edge_start[s + 1] = a.edges.len() as u32;
         }
         // Breadth-first: a child's fail state is where its parent's fail state goes on t.
         let mut queue: Vec<u32> = children[0].iter().map(|c| c.1).collect();
@@ -297,14 +323,6 @@ impl Automaton {
     }
 }
 
-/// count, id sum and the first ten ids of one answer, over some range of documents.
-#[derive(Clone, Copy, Default)]
-struct Acc {
-    count: u32,
-    sum: u64,
-    first: [u32; 10],
-}
-
 /// Masks of the bit positions whose index has bit k set: the sum of the set positions of
 /// a word x is the sum over k of popcount(x & MASK[k]) << k.
 const POSITION_BITS: [u64; 6] = [
@@ -316,42 +334,56 @@ const POSITION_BITS: [u64; 6] = [
     0xFFFF_FFFF_0000_0000,
 ];
 
-impl Acc {
+/// One thread's partial answers. Every distinct BOOL query and every distinct phrase has
+/// a slot with (count, id sum). `firsts` holds (slot, id) for the first ten ids of each
+/// slot within this thread's documents, appended in id order: a short list, instead of
+/// ten ids reserved for every slot in every thread.
+struct Answers {
+    totals: Vec<(u32, u64)>,
+    firsts: Vec<(u32, u32)>,
+}
+
+impl Answers {
+    #[inline(always)]
+    fn add(&mut self, slot: usize, doc: u32) {
+        let t = &mut self.totals[slot];
+        if t.0 < 10 {
+            self.firsts.push((slot as u32, doc));
+        }
+        t.0 += 1;
+        t.1 += u64::from(doc);
+    }
+
     /// Adds every document of a batch bitmap whose bit 0 is document `base`: counts and
     /// sums by popcount, a word at a time; ids one by one only while fewer than ten.
-    fn add_bits(&mut self, base: u32, bits: &[u64]) {
+    fn add_bits(&mut self, slot: usize, base: u32, bits: &[u64]) {
         for (w, &x) in bits.iter().enumerate().filter(|(_, &x)| x != 0) {
             let first = u64::from(base) + w as u64 * 64; // the document of bit 0
+            let t = &mut self.totals[slot];
             let mut low = x;
-            while self.count < 10 && low != 0 {
-                self.first[self.count as usize] = (first + u64::from(low.trailing_zeros())) as u32;
-                self.count += 1;
+            while t.0 < 10 && low != 0 {
+                self.firsts.push((
+                    slot as u32,
+                    (first + u64::from(low.trailing_zeros())) as u32,
+                ));
+                t.0 += 1;
                 low &= low - 1;
             }
-            self.count += low.count_ones(); // the bits not already counted above
+            t.0 += low.count_ones(); // the bits not already counted above
             let positions: u64 = POSITION_BITS
                 .iter()
                 .enumerate()
                 .map(|(k, &m)| u64::from((x & m).count_ones()) << k)
                 .sum();
-            self.sum += first * u64::from(x.count_ones()) + positions;
+            t.1 += first * u64::from(x.count_ones()) + positions;
         }
-    }
-
-    #[inline(always)]
-    fn add(&mut self, doc: u32) {
-        if self.count < 10 {
-            self.first[self.count as usize] = doc;
-        }
-        self.count += 1;
-        self.sum += u64::from(doc);
     }
 }
 
+/// A query line's answer: a distinct BOOL query, or a distinct phrase.
 enum Query {
-    Bool(Vec<(u8, u32)>), // (operator, bool-term index); the first operator is unused
-    Phrase(u32),          // distinct phrase id
-    Same(usize),          // a repeat of an earlier BOOL line: same answer
+    Bool(usize),
+    Phrase(usize),
 }
 
 /// Splits `buf` into `n` pieces that each end just after a newline.
@@ -372,21 +404,23 @@ fn split_lines(buf: &[u8], n: usize) -> Vec<&[u8]> {
 /// Shared, read-only inputs to every worker.
 struct Ctx<'a> {
     terms: &'a Terms,
-    bool_index: &'a [u32], // term id -> bool-term index, or NONE
-    phrase_term: &'a [bool],
     automaton: &'a Automaton,
-    queries: &'a [Query],
+    bool_queries: &'a [Vec<(u8, u32)>], // (operator, bool-term index); first operator unused
     n_bool_terms: usize,
     n_phrases: usize,
 }
 
-/// One thread's documents: per query (BOOL) and per phrase, the partial answers.
-fn work(ctx: &Ctx, chunk: &[u8]) -> (Vec<Acc>, Vec<Acc>) {
-    let mut bool_acc = vec![Acc::default(); ctx.queries.len()];
-    let mut phrase_acc = vec![Acc::default(); ctx.n_phrases];
+/// One thread's documents: the partial answers of every slot. BOOL queries use slots
+/// 0.., phrases the slots after them.
+fn work(ctx: &Ctx, chunk: &[u8]) -> Answers {
+    let phrase_slot = ctx.bool_queries.len();
+    let mut ans = Answers {
+        totals: vec![(0, 0); phrase_slot + ctx.n_phrases],
+        firsts: Vec::new(),
+    };
     let mut phrase_last = vec![NONE; ctx.n_phrases];
     let mut term_last = vec![NONE; ctx.n_bool_terms];
-    let mut pairs: Vec<(u32, u16)> = Vec::new();
+    let mut pairs: Vec<u32> = Vec::new(); // bool-term index << SHIFT | local doc
     let mut start = vec![0u32; ctx.n_bool_terms + 1];
     let mut docs: Vec<u16> = Vec::new();
     let (mut bits, mut keep) = ([0u64; BATCH / 64], [0u64; BATCH / 64]);
@@ -420,12 +454,13 @@ fn work(ctx: &Ctx, chunk: &[u8]) -> (Vec<Acc>, Vec<Acc>) {
                     state = 0;
                     return;
                 }
-                let b = ctx.bool_index[t as usize];
+                let term = &ctx.terms.keys[t as usize];
+                let b = term.bool_index;
                 if b != NONE && term_last[b as usize] != doc {
                     term_last[b as usize] = doc;
-                    pairs.push((b, local));
+                    pairs.push(b << SHIFT | u32::from(local));
                 }
-                state = if ctx.phrase_term[t as usize] {
+                state = if term.in_phrase {
                     ctx.automaton.step(state, t)
                 } else {
                     0
@@ -434,7 +469,7 @@ fn work(ctx: &Ctx, chunk: &[u8]) -> (Vec<Acc>, Vec<Acc>) {
                 loop {
                     if ph != NONE && phrase_last[ph as usize] != doc {
                         phrase_last[ph as usize] = doc;
-                        phrase_acc[ph as usize].add(doc);
+                        ans.add(phrase_slot + ph as usize, doc);
                     }
                     if next == NONE {
                         break;
@@ -481,14 +516,16 @@ fn work(ctx: &Ctx, chunk: &[u8]) -> (Vec<Acc>, Vec<Acc>) {
         // Counting sort of the pairs: docs[start[b]..start[b + 1]] are term b's local ids,
         // ascending because documents were read in order.
         start.fill(0);
-        for &(b, _) in &pairs {
+        for &x in &pairs {
+            let b = x >> SHIFT;
             start[b as usize + 1] += 1;
         }
         for b in 0..ctx.n_bool_terms {
             start[b + 1] += start[b];
         }
         docs.resize(pairs.len(), 0);
-        for &(b, d) in &pairs {
+        for &x in &pairs {
+            let (b, d) = (x >> SHIFT, (x & (BATCH as u32 - 1)) as u16);
             docs[start[b as usize] as usize] = d;
             start[b as usize] += 1;
         }
@@ -521,8 +558,7 @@ fn work(ctx: &Ctx, chunk: &[u8]) -> (Vec<Acc>, Vec<Acc>) {
         // Every BOOL query, strictly left to right, on this batch. The running set is a
         // bitmap over the batch (64 words, in L1): OR sets a list's bits, NOT clears them,
         // AND keeps the list's bits that are set, each one a branch-free bit operation.
-        for (q, query) in ctx.queries.iter().enumerate() {
-            let Query::Bool(steps) = query else { continue };
+        for (slot, steps) in ctx.bool_queries.iter().enumerate() {
             // AND and NOT keep an empty set empty, so an empty start skips to the first OR.
             let mut k = 1;
             if list(steps[0].1).is_empty() {
@@ -572,10 +608,10 @@ fn work(ctx: &Ctx, chunk: &[u8]) -> (Vec<Acc>, Vec<Acc>) {
                     }
                 }
             }
-            bool_acc[q].add_bits(base, &bits);
+            ans.add_bits(slot, base, &bits);
         }
     }
-    (bool_acc, phrase_acc)
+    ans
 }
 
 fn main() {
@@ -587,72 +623,64 @@ fn main() {
     // Queries: intern every term; give BOOL terms a dense index; number distinct phrases.
     let qtext = map(&format!("{data_dir}/queries.txt"));
     let mut terms = Terms::new();
-    let mut bool_index: Vec<u32> = Vec::new();
-    let mut phrase_term: Vec<bool> = Vec::new();
     let mut n_bool_terms = 0;
     let mut phrases: Vec<Vec<u32>> = Vec::new();
     let mut phrase_ids: std::collections::HashMap<Vec<u32>, u32> = std::collections::HashMap::new();
     let mut queries = Vec::new();
+    let mut bool_queries: Vec<Vec<(u8, u32)>> = Vec::new();
     let mut bool_seen: std::collections::HashMap<Vec<(u8, u32)>, usize> =
         std::collections::HashMap::new();
     for line in qtext.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
         let (kind, rest) = line.split_at(line.iter().position(|&c| c == b' ').unwrap());
         let words: Vec<&[u8]> = rest[1..].split(|&c| c == b' ').collect();
-        // Intern the line's terms first, so the per-term tables cover every id.
-        for (k, w) in words.iter().enumerate() {
-            if kind == b"PHRASE" || k % 2 == 0 {
-                let w: Vec<u8> = w.iter().copied().filter(|&c| c != b'"').collect();
-                terms.insert(&w);
-            }
-        }
-        bool_index.resize(terms.keys.len(), NONE);
-        phrase_term.resize(terms.keys.len(), false);
-        let id = |w: &[u8]| terms.get(&token_words(w, 0, w.len()), w.len()) as usize;
         if kind == b"BOOL" {
             let mut steps = Vec::new();
             for (k, w) in words.iter().enumerate().step_by(2) {
-                let t = id(w);
-                if bool_index[t] == NONE {
-                    bool_index[t] = n_bool_terms;
+                let t = terms.insert(w) as usize;
+                let term = &mut terms.keys[t];
+                if term.bool_index == NONE {
+                    term.bool_index = n_bool_terms;
                     n_bool_terms += 1;
                 }
-                steps.push((if k == 0 { b'O' } else { words[k - 1][0] }, bool_index[t]));
+                steps.push((if k == 0 { b'O' } else { words[k - 1][0] }, term.bool_index));
             }
-            let q = queries.len();
-            match bool_seen.entry(steps.clone()) {
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    queries.push(Query::Same(*e.get()))
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(q);
-                    queries.push(Query::Bool(steps));
-                }
+            let n = bool_queries.len();
+            let slot = *bool_seen.entry(steps.clone()).or_insert(n);
+            if slot == n {
+                bool_queries.push(steps); // repeated lines share one answer
             }
+            queries.push(Query::Bool(slot));
         } else {
             let inner = &rest[2..rest.len() - 1]; // strip ` "` and `"`
-            let seq: Vec<u32> = inner.split(|&c| c == b' ').map(|w| id(w) as u32).collect();
-            seq.iter().for_each(|&t| phrase_term[t as usize] = true);
+            let seq: Vec<u32> = inner
+                .split(|&c| c == b' ')
+                .map(|w| terms.insert(w))
+                .collect();
+            seq.iter()
+                .for_each(|&t| terms.keys[t as usize].in_phrase = true);
             let n = phrase_ids.len() as u32;
             let p = *phrase_ids.entry(seq.clone()).or_insert(n);
             if p == n {
                 phrases.push(seq);
             }
-            queries.push(Query::Phrase(p));
+            queries.push(Query::Phrase(p as usize));
         }
     }
     let automaton = Automaton::build(&phrases, terms.keys.len());
     let ctx = Ctx {
         terms: &terms,
-        bool_index: &bool_index,
-        phrase_term: &phrase_term,
         automaton: &automaton,
-        queries: &queries,
+        bool_queries: &bool_queries,
         n_bool_terms: n_bool_terms as usize,
         n_phrases: phrases.len(),
     };
 
     let docs = map(&format!("{data_dir}/docs.txt"));
-    let parts: Vec<(Vec<Acc>, Vec<Acc>)> = thread::scope(|sc| {
+    assert!(
+        n_bool_terms < 1 << (32 - SHIFT),
+        "too many BOOL terms to pack"
+    );
+    let parts: Vec<Answers> = thread::scope(|sc| {
         let handles: Vec<_> = split_lines(docs, threads)
             .into_iter()
             .map(|chunk| {
@@ -663,26 +691,31 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let mut out = Vec::with_capacity(queries.len() * 32);
-    for (q, query) in queries.iter().enumerate() {
-        let mut total = Acc::default();
-        for (bool_acc, phrase_acc) in &parts {
-            let a = match query {
-                Query::Bool(_) => &bool_acc[q],
-                Query::Same(q0) => &bool_acc[*q0],
-                Query::Phrase(p) => &phrase_acc[*p as usize],
-            };
-            for &d in &a.first[..a.count.min(10) as usize] {
-                if total.count < 10 {
-                    total.first[total.count as usize] = d;
-                }
-                total.count += 1;
-            }
-            total.count += a.count - a.count.min(10);
-            total.sum += a.sum;
+    // Merge in thread order, which is id order: counts and sums add, and each slot's
+    // first ten ids come from the earliest threads (each thread's list is in id order).
+    let n_slots = bool_queries.len() + phrases.len();
+    let mut totals = vec![(0u32, 0u64); n_slots];
+    let mut firsts = vec![(0usize, [0u32; 10]); n_slots];
+    for part in &parts {
+        for (t, &(c, s)) in totals.iter_mut().zip(&part.totals) {
+            (t.0, t.1) = (t.0 + c, t.1 + s);
         }
-        write!(out, "{} {}", total.count, total.sum).unwrap();
-        for d in &total.first[..total.count.min(10) as usize] {
+        for &(slot, doc) in &part.firsts {
+            let f = &mut firsts[slot as usize];
+            if f.0 < 10 {
+                f.1[f.0] = doc;
+                f.0 += 1;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(queries.len() * 32);
+    for query in &queries {
+        let slot = match *query {
+            Query::Bool(b) => b,
+            Query::Phrase(p) => bool_queries.len() + p,
+        };
+        write!(out, "{} {}", totals[slot].0, totals[slot].1).unwrap();
+        for d in &firsts[slot].1[..firsts[slot].0] {
             write!(out, " {d}").unwrap();
         }
         out.push(b'\n');

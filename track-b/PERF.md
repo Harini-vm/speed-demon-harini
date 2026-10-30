@@ -5,7 +5,8 @@ Every step from the reference to the final version, each with the live-board run
 | Step | Change | Board run (commit) | T (s) | M (MB) | Lines | K | Points |
 |---|---|---|---|---|---|---|---|
 | 0 | The reference, unchanged (scoring-box calibration) | | 56.35 | 2200 | 91 | 1 | 0 |
-| 1 | Rust: query-term-only index, Aho-Corasick phrases, SIMD tokenizer, batch bitmaps | _fill in_ | | | | | |
+| 1 | Rust: query-term-only index, Aho-Corasick phrases, SIMD tokenizer, batch bitmaps | `e8571e5` | 0.469 | 132 | 613 | 14.46 | 58.008 |
+| 2 | Compact per-thread answers, packed pairs, filtered term lookup, CSR automaton | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -27,3 +28,22 @@ Counting what the queries actually touch explained it. Over seed 1, the BOOL que
 ### Memory
 
 About 114 MB at 12 threads, plus the mapped input, which the harness does not charge. Most of it is per-thread partial answers (50,000 queries x 56 bytes) and the (term, doc) pairs of the current batch. The memory factor reaches its cap at 2,200 / 50 = 44 MB, so this is the next target.
+
+Board, step 1: T 120x faster contributes 10.96 to K, M 16.7x smaller contributes 1.76, and 613 lines (6.7x the reference) costs 0.75. Local 1.57 s on 2 cores became 0.47 s on 12 threads: the automaton and the term lookup scale with cores, but each thread still reads the whole query list per batch.
+
+## Step 2
+
+Memory first, because the memory factor stops growing at 44 MB:
+
+- Each thread kept 56 bytes for every one of the 50,000 query lines, including phrase lines and repeats that never used them. Now only distinct BOOL queries and distinct phrases get a slot, holding count and id sum (16 bytes). The first ten ids go to a per-thread list of (slot, id), appended only while a slot has fewer than ten hits in that thread's range. Because threads cover documents in id order and each list is in id order, the merge needs no sort.
+- A (term, local doc) pair is one u32 instead of eight bytes.
+
+At 12 threads: 114 MB to 79 MB, time unchanged within noise.
+
+Then time, with elimination tests on the scan (2 threads, wall): scanning about 330 ms, term lookup about 400, automaton about 300, postings and evaluation about 360.
+
+- A 256 KB filter with one bit per hash value now sits in front of the term table. About a fifth of corpus tokens are not query terms, and a clear bit rejects them without probing a cold slot.
+- Each term's key, length, BOOL index and phrase flag share one record, so a hit reads one cache line instead of three or four.
+- The automaton's transitions moved from a 2 MB hash table to per-state sorted edge lists (0.75 MB): most states have one to three edges.
+
+Local: about 1.65 s to 1.56 s. Steps of this size are below what the 2-core machine resolves, so the board decides.
