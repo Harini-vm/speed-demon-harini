@@ -6,7 +6,7 @@ Every step from the reference to the final version, each with the live-board run
 |---|---|---|---|---|---|---|---|
 | 0 | The reference, unchanged (scoring-box calibration) | | 32.05 | 228 | 56 | 1 | 0 |
 | 1 | Rust rewrite: mmap, parallel hand parsing, counting-sort scatter, select_nth percentiles, parallel formatting | `7d3b2cd` | 0.074 | 61 | 300 | 21.06 | 66.175 |
-| 2 | Branch-free parsing; counts kept per thread during the parse | _fill in_ | | | | | |
+| 2 | Branch-free parsing; counts kept per thread during the parse | `155b431` | 0.047 | 55 | 353 | 26.43 | 71.109 |
 
 ## Step 1
 
@@ -29,6 +29,6 @@ Merge and memory:
 
 4. **Counts during the parse.** Each thread counts lines and 5xx per (hour, local endpoint) cell while parsing, in a zero-allocated table whose untouched pages are never committed. This removes a full pass over the records and the per-thread count arrays sized to every group (about 13 MB at 12 threads). The cell counts become each thread's write cursors after one prefix sum in output order, and the scatter step no longer remaps endpoint ids per line.
 
-Local result, full seed 1: 179 ms to 118 ms (min of 11). Anonymous memory forced to 12 threads: 45 MB to 39 MB peak. The board's M also counts the 10 MB output file in the page cache, so expect about 55 MB there.
+Local result, full seed 1: 179 ms to 118 ms (min of 11). Anonymous memory forced to 12 threads: 45 MB to 39 MB peak. The board's M also counts the 10 MB output file in the page cache, so expect about 55 MB there. The board measured exactly 55 MB, and T fell from 74 ms to 47 ms (1.57x, close to the 1.5x seen locally).
 
 Correctness after this step: identical SHA-256 to the reference on tiny seeds 1 to 12, sample seeds 1 to 7, full seeds 1 and 42, the spec's worked example and an empty input, and on samples run with 1, 3, 7, 12 and 13 threads (chunk boundaries move with the thread count).

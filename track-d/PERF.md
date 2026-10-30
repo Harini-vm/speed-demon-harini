@@ -5,7 +5,7 @@ Every step from the reference to the final version, each with the live-board run
 | Step | Change | Board run (commit) | T (s) | M (MB) | Lines | K | Points |
 |---|---|---|---|---|---|---|---|
 | 0 | The reference, unchanged (scoring-box calibration) | | 72.69 | 893 | 43 | 1 | 0 |
-| 1 | Rust: bucketed CSR, BFS renumbering, bidirectional Dijkstra with a radix heap, u32 distances | _fill in_ | | | | | |
+| 1 | Rust: bucketed CSR, BFS renumbering, bidirectional Dijkstra with a radix heap, u32 distances | `155b431` | 0.252 | 203 | 435 | 16.12 | 60.373 |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -34,3 +34,5 @@ At 12 threads the first version used about 433 MB, nearly all of it 24 distance 
 3. returning freed memory to the OS. Per-phase logging showed that 72 MB of parse buckets stayed resident after being freed: glibc kept them in per-thread arenas. Forcing large allocations onto mmap returns them.
 
 Correctness after these changes: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the spec's worked example, and with 1, 3, 12 and 13 threads.
+
+Board, step 1: T 288x faster contributes 16.98 to K, M 4.4x smaller contributes 1.35, and 435 lines (10x the reference) costs 0.71. M was 203 MB against about 130 MB of live data measured locally, so the box's `memory.peak` sees more than the live set: a target for the next step, along with the source size.
