@@ -16,6 +16,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::Mutex;
 use std::thread;
 
 extern "C" {
@@ -170,6 +171,15 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     for b in 0..nb {
         base[b + 1] = base[b] + parts.iter().map(|p| p[b].len()).sum::<usize>();
     }
+    // Regroup by bucket, so each bucket's lists can be freed as soon as it is built.
+    let mut by_bucket: Vec<Vec<Vec<[u32; 3]>>> = (0..nb).map(|_| Vec::new()).collect();
+    for part in parts {
+        by_bucket
+            .iter_mut()
+            .zip(part)
+            .for_each(|(b, list)| b.push(list));
+    }
+    let by_bucket: Vec<Mutex<Vec<Vec<[u32; 3]>>>> = by_bucket.into_iter().map(Mutex::new).collect();
 
     // Counting sort, one bucket at a time: its degree counts fit in L1, and each bucket owns
     // a disjoint range of `off` and of `adj`, so no atomics are needed.
@@ -185,9 +195,8 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
             if b >= nb {
                 break;
             }
-            let (lo, edges) = (b << SHIFT, || {
-                parts.iter().flat_map(|p: &Vec<Vec<[u32; 3]>>| &p[b])
-            });
+            let lists = std::mem::take(&mut *by_bucket[b].lock().unwrap());
+            let (lo, edges) = (b << SHIFT, || lists.iter().flatten());
             cursor.fill(0);
             edges().for_each(|&[u, _, _]| cursor[u as usize - lo] += 1);
             let mut c = base[b] as u32;
@@ -209,24 +218,41 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
 /// are a random relabelling, which makes nearly every edge a cache miss; after this, a
 /// Dijkstra ball lives in a few compact ranges of `off`, `adj` and `dist`.
 ///
-/// Every thread grows breadth-first regions from roots in its own slice of the old ids,
-/// claiming nodes with an atomic flag; the regions are then laid out one after another.
+/// Every thread grows regions from roots in its own slice of the old ids, claiming nodes
+/// with an atomic flag, and the threads' orders are then laid out one after another. A
+/// region is a breadth-first ball of at most REGION nodes, about an 8 x 8 patch of the
+/// map, and the next region starts where the last one stopped, so a search's ball covers
+/// whole patches instead of thin slices of long breadth-first rings.
+const REGION: usize = 64;
+
 fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
     let n = g.off.len() - 1;
     let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let claim = |x: usize| !claimed[x].load(Relaxed) && !claimed[x].swap(true, Relaxed);
     let orders = par_map((0..threads).collect(), |t| {
         let mut order: Vec<u32> = Vec::with_capacity(n / threads + n / threads / 4);
-        for root in (n * t / threads..n * (t + 1) / threads).filter(|&r| claim(r)) {
-            let mut head = order.len();
-            order.push(root as u32);
-            while head < order.len() {
-                let u = order[head] as usize;
-                head += 1;
-                let next = g.adj[g.off[u] as usize..g.off[u + 1] as usize]
-                    .iter()
-                    .map(|e| e.0);
-                order.extend(next.filter(|&v| claim(v as usize)));
+        let mut seeds = std::collections::VecDeque::new();
+        for root in n * t / threads..n * (t + 1) / threads {
+            seeds.push_back(root as u32);
+            while let Some(seed) = seeds.pop_front() {
+                if !claim(seed as usize) {
+                    continue;
+                }
+                let (start, mut head) = (order.len(), order.len());
+                order.push(seed);
+                while head < order.len() {
+                    let u = order[head] as usize;
+                    head += 1;
+                    for &(v, _) in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
+                        if order.len() - start < REGION {
+                            if claim(v as usize) {
+                                order.push(v);
+                            }
+                        } else if !claimed[v as usize].load(Relaxed) {
+                            seeds.push_back(v); // the next region starts at this one's edge
+                        }
+                    }
+                }
             }
         }
         order
@@ -534,14 +560,12 @@ fn main() {
     drop(new_id);
     let rev = reverse(&g, threads);
 
-    // Queries sorted by source and handed out in contiguous runs (two per thread): after
-    // the renumbering, each thread then searches one part of the map, so it touches only
-    // that part of its distance arrays and keeps it in cache. Answers: i64, -1 unreachable.
+    // Queries sorted by source and handed out four at a time: the threads then all work in
+    // one moving part of the renumbered map, which the shared cache holds, and short runs
+    // keep a few long searches from leaving one thread last. Answers: i64, -1 unreachable.
     let mut by_source: Vec<usize> = (0..queries.len()).collect();
     by_source.sort_unstable_by_key(|&q| queries[q].0);
-    let runs: Vec<&[usize]> = by_source
-        .chunks(queries.len().div_ceil(threads * 2).max(1))
-        .collect();
+    let runs: Vec<&[usize]> = by_source.chunks(4).collect();
     let answers: Vec<AtomicI64> = queries.iter().map(|_| AtomicI64::new(-1)).collect();
     let (next, n) = (AtomicUsize::new(0), g.off.len() - 1);
     let no_edges = |g: &Graph, x: usize| g.off[x] == g.off[x + 1];

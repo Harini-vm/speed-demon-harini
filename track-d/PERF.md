@@ -8,7 +8,8 @@ Every step from the reference to the final version, each with the live-board run
 | 1 | Rust: bucketed CSR, BFS renumbering, bidirectional Dijkstra with a radix heap, u32 distances | `155b431` | 0.252 | 203 | 435 | 16.12 | 60.373 |
 | 2 | SWAR number parsing, u32 heap keys, parallel renumbering bookkeeping | `5e6ffc1` | 0.236 | 199 | 482 | 16.50 | 60.873 |
 | 3 | Smaller source: the same logic in fewer lines | `e5a377e` | 0.230 | 202 | 436 | 16.90 | 61.394 |
-| 4 | Distances in a small page pool; parse buckets that free back to the OS | _fill in_ | | | | | |
+| 4 | Distances in a small page pool; parse buckets that free back to the OS | `1d33d23` | 0.217 | 114 | 469 | 19.28 | 64.257 |
+| 5 | Patch-shaped renumbering; queries handed out four at a time; parse buckets freed one by one | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -74,3 +75,15 @@ The renumbering map is also dropped once the queries are translated, before the 
 Peak anonymous memory at 12 threads: 192 MB to 105 MB. It was also faster locally: 786 to 702 ms (2 threads, min of 9, alternating runs). The page table fits in L1 and the pool in L2, where the old arrays sent most reads to memory.
 
 459 code lines (from 427). Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, and with 1, 3 and 13 threads.
+
+Board, step 4: M 202 to 114 MB and T 230 to 217 ms, 61.394 to 64.257 points.
+
+## Step 5: locality and scheduling
+
+The searches are limited by memory latency, not instructions. A callgrind profile counted many instructions in the radix heap, but swapping it for a binary heap of packed keys changed nothing measurable (query phase 328 vs 333 ms), and neither did a bitmask of non-empty buckets. So both experiments were dropped.
+
+- **Patch-shaped renumbering.** A plain breadth-first order lays the map out as long rings, so a search's ball touches a thin slice of many rings, and each slice is a few nodes of a different cache line. Each region is now a breadth-first ball of at most 64 nodes, about an 8 x 8 patch, and the next region starts at the edge of the last one. Query phase (2 threads, min of 7 runs): 360 to 333 ms, for about 10 ms more renumbering. Region sizes 16, 32, 64, 128 and 256 were all within noise of each other; 64 was the best. The box's 24 MB L3 holds much less of the graph than this machine's, so the effect there should be larger.
+- **Scheduling.** I simulated the old split (24 runs in source order, 12 workers) with per-query costs from an instrumented build: the busiest thread got 1.20x the average. Runs of 4 queries bring that to about 1.06x. Distances now live in per-thread page pools, so short runs no longer cost memory.
+- **Parse buckets** are regrouped by bucket and each bucket's lists are freed right after the CSR build uses them: build phase peak 99 to 65 MB at 12 threads. The overall peak (about 101 MB) is now renumbering, with the old and new graphs both alive, and the queries.
+
+479 code lines. Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, and with 1, 3 and 13 threads.
