@@ -8,7 +8,7 @@ Every step from the reference to the final version, each with the live-board run
 | 1 | Rust: structural (AVX2 bitmask) CSV parsing, array join, shared lock-free name sets | `e8571e5` | 0.092 | 41 | 416 | 15.88 | 60.036 |
 | 2 | Country marks moved out of the shared table into private per-thread lists; regions read with plain iterators | `5e6ffc1` | 0.082 | 41 | 411 | 16.83 | 61.302 |
 | 3 | Smaller source: the same logic in fewer lines | _fill in_ | | | | | |
-| 4 | Name ids folded into per-country bitmaps after each of four parse rounds | _fill in_ | | | | | |
+| 4 | Name ids folded into per-country bitmaps after each of four parse rounds; one-line name slots | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -59,4 +59,15 @@ The file is now parsed in four rounds, each one chunk per thread. After each rou
 
 Peak anonymous memory at 12 threads by number of rounds: 29 MB with one pass, then 22 (2 rounds), 18 (4) and 15 (8). Every round costs two thread launches and a wait for the slowest chunk. On this 2-core machine with 12 forced threads, 8 rounds measured about 7% slower, 4 about 4%. With 2 threads, run time was unchanged. I chose 4.
 
-387 code lines (from 385). Correctness: identical SHA-256 to the reference on tiny seeds 1 to 25, sample seeds 1 to 6, full seeds 1 and 13, the worked example, a file without a final terminator, a header-only file, and with 1, 3 and 13 threads.
+Correctness: identical SHA-256 to the reference on tiny seeds 1 to 25, sample seeds 1 to 6, full seeds 1 and 13, the worked example, a file without a final terminator, a header-only file, and with 1, 3 and 13 threads.
+
+### Name lookups
+
+Elimination test (2 threads, min of 7): the run took 323 ms, 161 ms with the lookup replaced by the hash alone, and 139 ms with neither. So lookups were about half the run, and hashing only a small part of that. Each lookup read two random places: the slot, then the name's record in the arena. The bytes were also gathered with a variable-length copy for the last word, in the hash and again in every comparison.
+
+- **32-byte slots.** A slot now holds the hash tag, the length, the id and, for names up to 24 bytes, the name itself, so a lookup reads one cache line. Longer names (about one record in 100,000 at full scale) keep their bytes in the arena. A thread claims an empty slot with a compare-and-swap to a busy marker, fills it, then publishes it; a reader that meets the marker waits for it. Ids are now handed out only to the thread that won the slot, so they have no gaps. With 2^18 slots, about 100,000 names fill under two fifths of the table. The table is 8 MB, about what the old slots and arena used together.
+- **Eight-byte loads.** A name is always followed in its record by at least `,,1,0.00`, so loading a whole word at its last bytes stays inside the mapped file. The word is masked instead of copied.
+
+Local, 2 threads: 328 ms to 216 ms (min of 9, alternating runs); with 12 forced threads, 306 ms to 224 ms. Peak anonymous memory at 12 threads: 19 MB.
+
+407 code lines (from 385). Correctness: identical SHA-256 to the reference on tiny seeds 1 to 25, sample seeds 1 to 6, full seeds 1 and 13, the worked example, a file without a final terminator, a header-only file, a hand-made file with names longer than 24 bytes, exactly 23 and 24 bytes and with escaped quotes, and with 1, 3 and 13 threads.

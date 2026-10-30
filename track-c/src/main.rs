@@ -170,16 +170,18 @@ fn number(b: &[u8]) -> u64 {
     b.iter().fold(0, |v, &c| v * 10 + u64::from(c - b'0'))
 }
 
-/// Word `i` of a byte string, little-endian, zero-padded past its end.
+/// Word `i` of a name, little-endian, zero-padded past its end. The load may read up to
+/// seven bytes past the name, which are always in the mapped file: a name is followed in
+/// its record by at least a quote or comma, a note, a region id and an amount (`,,1,0.00`).
 #[inline(always)]
 fn word(s: &[u8], i: usize) -> u64 {
-    let rest = &s[i * 8..];
-    if rest.len() >= 8 {
-        u64::from_le_bytes(rest[..8].try_into().unwrap())
+    let left = s.len() - i * 8;
+    // SAFETY: bytes s[i * 8..i * 8 + 8] are inside the mapping, as above.
+    let w = unsafe { std::ptr::read_unaligned(s.as_ptr().add(i * 8).cast::<u64>()) };
+    if left >= 8 {
+        w
     } else {
-        let mut t = [0u8; 8];
-        t[..rest.len()].copy_from_slice(rest);
-        u64::from_le_bytes(t)
+        w & ((1 << (left * 8)) - 1)
     }
 }
 
@@ -194,18 +196,21 @@ fn hash(s: &[u8]) -> u64 {
 
 /// The distinct names, shared by all threads, each with a dense id.
 ///
-/// A name is stored once in `words` as [id][len][name, zero-padded] and found through an
-/// open-addressing table whose slots hold the top 32 bits of the name's hash and the
-/// record's word offset. It is one copy of about 100,000 names, small enough for L3, and
-/// after warm-up nothing writes to it, so its cache lines stay shared by all cores. New
-/// names are added without locks: the record is written at a bump-allocated offset, then
-/// published with a compare-and-swap on the empty slot (a loser's record stays unused).
+/// An open-addressing table of 32-byte slots, so one lookup reads one cache line. Word 0
+/// is 0 for an empty slot, BUSY while a thread fills it, else the top 24 bits of the
+/// name's hash, the length (capped at 255) and id + 1. A name of up to 24 bytes sits in
+/// words 1 to 3; a longer one in `long` as [length][name], with its offset in word 1.
+/// After warm-up nothing writes to the table, so its cache lines stay shared by all
+/// cores. A new name is added without a lock: a compare-and-swap claims the slot.
 struct Names<'a> {
     slots: &'a [AtomicU64],
-    words: &'a [AtomicU64],
+    long: &'a [AtomicU64],
     used: AtomicUsize,
     ids: AtomicUsize,
 }
+
+const BUSY: u64 = u64::MAX;
+const INLINE: usize = 24;
 
 /// Views zeroed u64 storage as atomics. Zeroed allocations are lazily committed, so a
 /// generous capacity costs only the pages that are written.
@@ -220,33 +225,54 @@ impl Names<'_> {
     fn id(&self, name: &[u8]) -> u32 {
         let h = hash(name);
         let n = name.len().div_ceil(8);
-        let (mask, tag) = (self.slots.len() - 1, h & !0xFFFF_FFFF);
+        let key = (h & !0xFF_FFFF_FFFF) | (name.len().min(255) as u64) << 32;
+        let mask = self.slots.len() / 4 - 1;
         let mut s = h as usize & mask;
         loop {
-            let mut e = self.slots[s].load(Acquire);
+            let slot = &self.slots[s * 4..s * 4 + 4];
+            let mut e = slot[0].load(Acquire);
             if e == 0 {
-                let w = self.used.fetch_add(2 + n, Relaxed);
-                assert!(w + 2 + n <= self.words.len(), "name storage full");
-                self.words[w].store(self.ids.fetch_add(1, Relaxed) as u64, Relaxed);
-                self.words[w + 1].store(name.len() as u64, Relaxed);
-                for i in 0..n {
-                    self.words[w + 2 + i].store(word(name, i), Relaxed);
-                }
-                match self.slots[s].compare_exchange(0, tag | (w as u64 + 1), Release, Acquire) {
-                    Ok(_) => return self.words[w].load(Relaxed) as u32,
-                    Err(winner) => e = winner, // another thread filled this slot first
+                match slot[0].compare_exchange(0, BUSY, Acquire, Acquire) {
+                    Ok(_) => return self.fill(slot, name, key),
+                    Err(now) => e = now, // another thread claimed this slot first
                 }
             }
-            let w = (e & 0xFFFF_FFFF) as usize - 1;
-            if e & !0xFFFF_FFFF == tag
-                && self.words[w + 1].load(Relaxed) == name.len() as u64
-                && (0..n).all(|i| self.words[w + 2 + i].load(Relaxed) == word(name, i))
+            while e == BUSY {
+                std::hint::spin_loop();
+                e = slot[0].load(Acquire);
+            }
+            let words = |w: &[AtomicU64]| (0..n).all(|i| w[i].load(Relaxed) == word(name, i));
+            if e & !0xFFFF_FFFF == key
+                && if name.len() <= INLINE {
+                    words(&slot[1..])
+                } else {
+                    let w = slot[1].load(Relaxed) as usize;
+                    self.long[w].load(Relaxed) == name.len() as u64 && words(&self.long[w + 1..])
+                }
             {
-                return self.words[w].load(Relaxed) as u32;
+                return e as u32 - 1;
             }
             s = (s + 1) & mask;
             assert!(s != h as usize & mask, "name table full");
         }
+    }
+
+    /// Stores `name` in the slot this thread claimed, then publishes it with its new id.
+    fn fill(&self, slot: &[AtomicU64], name: &[u8], key: u64) -> u32 {
+        let n = name.len().div_ceil(8);
+        let dst = if name.len() <= INLINE {
+            &slot[1..]
+        } else {
+            let w = self.used.fetch_add(1 + n, Relaxed);
+            assert!(w + 1 + n <= self.long.len(), "name storage full");
+            self.long[w].store(name.len() as u64, Relaxed);
+            slot[1].store(w as u64, Relaxed);
+            &self.long[w + 1..]
+        };
+        (0..n).for_each(|i| dst[i].store(word(name, i), Relaxed));
+        let id = self.ids.fetch_add(1, Relaxed) as u32;
+        slot[0].store(key | u64::from(id + 1), Release);
+        id
     }
 }
 
@@ -418,17 +444,17 @@ fn main() {
         .position(|&c| c == b'\n')
         .map_or(records.len(), |i| i + 1);
     let body = &records[header_end..];
-    // Shared name storage: 2^19 slots (about 100,000 names fill under a fifth of them) and
-    // room for every record to bring a new name, of which only the used pages are touched.
-    let mut slot_mem = vec![0u64; 1 << 19];
-    let mut word_mem = vec![0u64; body.len() / 2 + 1024];
-    // Per-country name bitmaps. Ids are below the slot count, so a row of 2^19 bits always
+    // Shared name storage: 2^18 slots (about 100,000 names fill under two fifths of them),
+    // and room for every record to bring a long name, of which only used pages are touched.
+    let mut slot_mem = vec![0u64; 4 << 18];
+    let mut long_mem = vec![0u64; body.len() / 2 + 1024];
+    // Per-country name bitmaps. Ids are below the slot count, so a row of 2^18 bits always
     // fits; the storage is zero-allocated, so only the pages under used ids are committed.
-    let stride = slot_mem.len() / 64;
+    let stride = slot_mem.len() / 4 / 64;
     let mut seen = vec![0u64; groups * stride];
     let names = Names {
         slots: atomics(&mut slot_mem),
-        words: atomics(&mut word_mem),
+        long: atomics(&mut long_mem),
         used: AtomicUsize::new(0),
         ids: AtomicUsize::new(0),
     };
