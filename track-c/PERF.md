@@ -8,6 +8,7 @@ Every step from the reference to the final version, each with the live-board run
 | 1 | Rust: structural (AVX2 bitmask) CSV parsing, array join, shared lock-free name sets | `e8571e5` | 0.092 | 41 | 416 | 15.88 | 60.036 |
 | 2 | Country marks moved out of the shared table into private per-thread lists; regions read with plain iterators | `5e6ffc1` | 0.082 | 41 | 411 | 16.83 | 61.302 |
 | 3 | Smaller source: the same logic in fewer lines | _fill in_ | | | | | |
+| 4 | Name ids folded into per-country bitmaps after each of four parse rounds | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -49,3 +50,13 @@ Source size is 15% of the exponent, and this file was 402 code lines against the
 Region codes need no sort: a code's base-26 key orders like the code, so walking the 26^3 table in key order hands out ranks in output order. `par_map` for the parse threads and the distinct-count workers.
 
 402 to 385 code lines. Run time unchanged in alternating runs against the previous build. Correctness: identical SHA-256 to the reference on the full seed battery, the worked example, and with 1, 3 and 13 threads.
+
+## Step 4: memory
+
+I sampled anonymous memory every millisecond with a copy forced to 12 threads: the peak was 29 MB, and it grew steadily through the parse. The per-country id lists were most of it. Every record appends a 4-byte name id, so 3.3 million ids, about 13 MB, plus up to the same again in unused capacity from doubling.
+
+The file is now parsed in four rounds, each one chunk per thread. After each round, one worker per country sets the bits of that round's ids in the country's bitmap of 2^19 bits, and the lists are cleared for the next round, keeping their capacity. The bitmaps are zero-allocated, and ids are dense, so only about 12.5 KB per country is ever touched. The distinct count is a popcount, which also replaces the old pass with a `last[id]` stamp array per worker.
+
+Peak anonymous memory at 12 threads by number of rounds: 29 MB with one pass, then 22 (2 rounds), 18 (4) and 15 (8). Every round costs two thread launches and a wait for the slowest chunk. On this 2-core machine with 12 forced threads, 8 rounds measured about 7% slower, 4 about 4%. With 2 threads, run time was unchanged. I chose 4.
+
+387 code lines (from 385). Correctness: identical SHA-256 to the reference on tiny seeds 1 to 25, sample seeds 1 to 6, full seeds 1 and 13, the worked example, a file without a final terminator, a header-only file, and with 1, 3 and 13 threads.

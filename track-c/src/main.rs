@@ -3,15 +3,17 @@
 //! 1. Load regions.csv into a direct table: region_id -> country rank, where ranks follow
 //!    the output order (country codes sorted, `_UNMATCHED` last).
 //! 2. mmap records.csv and split it into one chunk per thread at record boundaries.
-//! 3. Each thread parses its records by hand (spec section 2.1) and keeps, per country,
-//!    the running sums and a bitset of the names it saw, by thread-local name id.
-//! 4. Merge: give every distinct name a global id (sharded across threads), OR the
-//!    per-thread bitsets into one per country, popcount, and write the sorted lines.
+//! 3. Each thread parses its records by hand (spec section 2.1), keeps the running sums
+//!    per country, and gets each name's dense id from one shared lock-free table.
+//! 4. The file is parsed in rounds. After each, one worker per country sets the bits of
+//!    that round's name ids in the country's bitmap, so the id lists stay small.
+//! 5. Merge the sums, popcount the bitmaps, and write the sorted lines.
 
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::Mutex;
 use std::thread;
 
 extern "C" {
@@ -282,11 +284,15 @@ impl Agg {
     }
 }
 
+/// One parse thread's state, carried from round to round: aggregates per country, and
+/// the name ids of the current round per country.
+type State = (Vec<Agg>, Vec<Vec<u32>>);
+
 /// Parses whole records (`buf` starts at a record and ends after a terminator or at EOF)
-/// into per-country aggregates and per-country lists of name ids.
-fn parse(buf: &[u8], country_of: &[u8], names: &Names, groups: usize) -> (Vec<Agg>, Vec<Vec<u32>>) {
-    let mut aggs = vec![Agg::EMPTY; groups];
-    let mut name_ids = vec![Vec::new(); groups];
+/// into the aggregates and this round's name id lists.
+fn parse(buf: &[u8], country_of: &[u8], names: &Names, (mut aggs, mut name_ids): State) -> State {
+    name_ids.iter_mut().for_each(Vec::clear); // the last round's ids are in the bitmaps
+    let groups = aggs.len();
     let mut seps = Separators::new(buf);
     let mut start = 0;
     while start < buf.len() {
@@ -363,6 +369,9 @@ fn money(c: i64) -> String {
     )
 }
 
+/// Parse rounds: more rounds keep the id lists smaller, at one more pause per round.
+const ROUNDS: usize = 4;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", String::as_str);
@@ -413,44 +422,45 @@ fn main() {
     // room for every record to bring a new name, of which only the used pages are touched.
     let mut slot_mem = vec![0u64; 1 << 19];
     let mut word_mem = vec![0u64; body.len() / 2 + 1024];
+    // Per-country name bitmaps. Ids are below the slot count, so a row of 2^19 bits always
+    // fits; the storage is zero-allocated, so only the pages under used ids are committed.
+    let stride = slot_mem.len() / 64;
+    let mut seen = vec![0u64; groups * stride];
     let names = Names {
         slots: atomics(&mut slot_mem),
         words: atomics(&mut word_mem),
         used: AtomicUsize::new(0),
         ids: AtomicUsize::new(0),
     };
+    // The file is parsed in ROUNDS rounds of one chunk per thread. After each round, one
+    // worker per country moves that round's ids into the country's bitmap. The id lists
+    // only ever hold one round's worth, a quarter of the file's 3.3 million ids.
     let (country_of, names) = (&country_of, &names);
-    let parts = par_map(split_records(body, threads), |chunk| {
-        parse(chunk, country_of, names, groups)
-    });
-
-    // Distinct names per country, one country at a time per worker. `last[id]` is the last
-    // country that counted name `id`, so it never needs clearing between countries.
-    let (next, n_ids) = (AtomicUsize::new(0), names.ids.load(Relaxed));
-    let mut distinct = vec![0usize; groups];
-    let found = par_map(vec![(); threads], |()| {
-        let (mut last, mut out) = (vec![u16::MAX; n_ids], Vec::new());
-        loop {
-            let g = next.fetch_add(1, Relaxed);
-            if g >= groups {
-                return out;
+    let mut states: Vec<State> = (0..threads)
+        .map(|_| (vec![Agg::EMPTY; groups], vec![Vec::new(); groups]))
+        .collect();
+    for round in split_records(body, threads * ROUNDS).chunks(threads) {
+        let jobs: Vec<_> = round.iter().zip(states).collect();
+        states = par_map(jobs, |(chunk, st)| parse(chunk, country_of, names, st));
+        let rows = Mutex::new(seen.chunks_mut(stride).enumerate());
+        par_map(vec![(); threads], |()| loop {
+            let Some((g, row)) = rows.lock().unwrap().next() else {
+                break;
+            };
+            for &id in states.iter().flat_map(|st| &st.1[g]) {
+                row[id as usize / 64] |= 1 << (id % 64);
             }
-            let ids = parts.iter().flat_map(|p| &p.1[g]).map(|&id| id as usize);
-            out.push((
-                g,
-                ids.filter(|&id| std::mem::replace(&mut last[id], g as u16) != g as u16)
-                    .count(),
-            ));
-        }
-    });
-    found
-        .into_iter()
-        .flatten()
-        .for_each(|(g, n)| distinct[g] = n);
+        });
+    }
+    let words = names.ids.load(Relaxed).div_ceil(64);
+    let distinct: Vec<u32> = seen
+        .chunks(stride)
+        .map(|row| row[..words].iter().map(|w| w.count_ones()).sum())
+        .collect();
     let mut text = String::new();
     for g in 0..groups {
         let mut a = Agg::EMPTY;
-        parts.iter().for_each(|p| a.merge(&p.0[g]));
+        states.iter().for_each(|st| a.merge(&st.0[g]));
         if a.count == 0 {
             continue;
         }
