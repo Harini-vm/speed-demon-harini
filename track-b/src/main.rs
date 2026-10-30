@@ -11,6 +11,7 @@
 //! 4. Thread ranges are in id order, so the totals merge by adding counts and sums and
 //!    taking the first ten ids from the earliest ranges.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -41,23 +42,6 @@ const BATCH: usize = 4096;
 /// A (bool term, local doc) pair packs into one u32: the doc takes the low SHIFT bits.
 const SHIFT: u32 = BATCH.trailing_zeros();
 const NONE: u32 = u32::MAX;
-
-/// Spec 2.2 as a table: the lowercase byte for [A-Za-z0-9], 0 for every separator.
-const fn token_bytes() -> [u8; 256] {
-    let mut t = [0u8; 256];
-    let mut b = 0;
-    while b < 256 {
-        let c = b as u8;
-        t[b] = match c {
-            b'a'..=b'z' | b'0'..=b'9' => c,
-            b'A'..=b'Z' => c + 32,
-            _ => 0,
-        };
-        b += 1;
-    }
-    t
-}
-const TOKEN: [u8; 256] = token_bytes();
 
 const LOWER: u64 = 0x2020_2020_2020_2020;
 
@@ -187,14 +171,11 @@ impl Terms {
 /// Bit k is set if `buf[i + k]` is a token byte ([A-Za-z0-9]); 0 past the end of `buf`.
 #[inline(always)]
 fn class_mask(buf: &[u8], i: usize) -> u64 {
-    if i + 64 > buf.len() {
-        return class_mask_tail(buf, i);
-    }
     #[cfg(target_feature = "avx2")]
-    {
+    if i + 64 <= buf.len() {
         use std::arch::x86_64::*;
         // SAFETY: AVX2 is enabled at compile time and the 64 bytes are inside `buf`.
-        unsafe {
+        return unsafe {
             let half = |off: usize| {
                 let v = _mm256_loadu_si256(buf.as_ptr().add(i + off).cast());
                 let l = _mm256_or_si256(v, _mm256_set1_epi8(0x20));
@@ -210,24 +191,12 @@ fn class_mask(buf: &[u8], i: usize) -> u64 {
                 _mm256_movemask_epi8(_mm256_or_si256(alpha, digit)) as u32
             };
             u64::from(half(0)) | u64::from(half(32)) << 32
-        }
+        };
     }
-    #[cfg(not(target_feature = "avx2"))]
-    {
-        buf[i..i + 64]
-            .iter()
-            .enumerate()
-            .fold(0, |m, (k, &c)| m | u64::from(TOKEN[c as usize] != 0) << k)
-    }
-}
-
-#[cold]
-fn class_mask_tail(buf: &[u8], i: usize) -> u64 {
-    buf[i.min(buf.len())..]
-        .iter()
-        .take(64)
-        .enumerate()
-        .fold(0, |m, (k, &c)| m | u64::from(TOKEN[c as usize] != 0) << k)
+    // The last block of the file, or a build without AVX2.
+    buf[i..].iter().take(64).enumerate().fold(0, |m, (k, &c)| {
+        m | u64::from(c.is_ascii_alphanumeric()) << k
+    })
 }
 
 /// Aho-Corasick over term ids: reports every distinct phrase that ends at a position.
@@ -388,17 +357,26 @@ enum Query {
 
 /// Splits `buf` into `n` pieces that each end just after a newline.
 fn split_lines(buf: &[u8], n: usize) -> Vec<&[u8]> {
-    let mut out = Vec::with_capacity(n);
-    let mut start = 0;
+    let mut cuts = vec![0];
     for i in 1..=n {
-        let mut end = (buf.len() * i / n).max(start);
-        while end < buf.len() && (end == 0 || buf[end - 1] != b'\n') {
-            end += 1;
-        }
-        out.push(&buf[start..end]);
-        start = end;
+        let at = (buf.len() * i / n).max(*cuts.last().unwrap());
+        cuts.push(
+            buf[at..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(buf.len(), |k| at + k + 1),
+        );
     }
-    out
+    cuts.windows(2).map(|w| &buf[w[0]..w[1]]).collect()
+}
+
+/// Runs `f` on every item, one thread each, and returns the results in order.
+fn par_map<I: Send, T: Send>(items: Vec<I>, f: impl Fn(I) -> T + Sync) -> Vec<T> {
+    thread::scope(|sc| {
+        let f = &f;
+        let handles: Vec<_> = items.into_iter().map(|x| sc.spawn(move || f(x))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
 }
 
 /// Shared, read-only inputs to every worker.
@@ -423,7 +401,7 @@ fn work(ctx: &Ctx, chunk: &[u8]) -> Answers {
     let mut pairs: Vec<u32> = Vec::new(); // bool-term index << SHIFT | local doc
     let mut start = vec![0u32; ctx.n_bool_terms + 1];
     let mut docs: Vec<u16> = Vec::new();
-    let (mut bits, mut keep) = ([0u64; BATCH / 64], [0u64; BATCH / 64]);
+    let mut keep = [0u64; BATCH / 64];
     let mut dense: Vec<[u64; BATCH / 64]> = Vec::new();
     let mut dense_of = vec![NONE; ctx.n_bool_terms];
 
@@ -555,9 +533,19 @@ fn work(ctx: &Ctx, chunk: &[u8]) -> Answers {
             }
         }
 
-        // Every BOOL query, strictly left to right, on this batch. The running set is a
-        // bitmap over the batch (64 words, in L1): OR sets a list's bits, NOT clears them,
-        // AND keeps the list's bits that are set, each one a branch-free bit operation.
+        // Every BOOL query, strictly left to right, on this batch, on 64-word bitmaps of
+        // the batch (in L1). A term with a precomputed bitmap is used as it is; any other
+        // term's list is set into a scratch bitmap. Then OR, AND and NOT are word operations.
+        let bitmap = |b: u32, scratch: &mut [u64; BATCH / 64]| -> [u64; BATCH / 64] {
+            if b != NONE && dense_of[b as usize] != NONE {
+                return dense[dense_of[b as usize] as usize];
+            }
+            scratch.fill(0);
+            list(b)
+                .iter()
+                .for_each(|&d| scratch[d as usize / 64] |= 1 << (d % 64));
+            *scratch
+        };
         for (slot, steps) in ctx.bool_queries.iter().enumerate() {
             // AND and NOT keep an empty set empty, so an empty start skips to the first OR.
             let mut k = 1;
@@ -569,43 +557,15 @@ fn work(ctx: &Ctx, chunk: &[u8]) -> Answers {
                     continue;
                 }
             }
-            match steps[0].1 {
-                b if b != NONE && dense_of[b as usize] != NONE => {
-                    bits = dense[dense_of[b as usize] as usize]
-                }
-                b => {
-                    bits.fill(0);
-                    list(b)
-                        .iter()
-                        .for_each(|&d| bits[d as usize / 64] |= 1 << (d % 64));
-                }
-            }
+            let mut bits = bitmap(steps[0].1, &mut keep);
             for &(op, b) in &steps[k..] {
-                if b != NONE && dense_of[b as usize] != NONE {
-                    let m = &dense[dense_of[b as usize] as usize];
-                    for (x, &y) in bits.iter_mut().zip(m) {
-                        *x = match op {
-                            b'O' => *x | y,
-                            b'N' => *x & !y,
-                            _ => *x & y,
-                        };
-                    }
-                    continue;
-                }
-                let docs = list(b);
-                match op {
-                    b'O' => docs
-                        .iter()
-                        .for_each(|&d| bits[d as usize / 64] |= 1 << (d % 64)),
-                    b'N' => docs
-                        .iter()
-                        .for_each(|&d| bits[d as usize / 64] &= !(1 << (d % 64))),
-                    _ => {
-                        keep.fill(0);
-                        docs.iter()
-                            .for_each(|&d| keep[d as usize / 64] |= 1 << (d % 64));
-                        bits.iter_mut().zip(&keep).for_each(|(x, &y)| *x &= y);
-                    }
+                let m = bitmap(b, &mut keep);
+                for (x, y) in bits.iter_mut().zip(m) {
+                    *x = match op {
+                        b'O' => *x | y,
+                        b'N' => *x & !y,
+                        _ => *x & y,
+                    };
                 }
             }
             ans.add_bits(slot, base, &bits);
@@ -625,11 +585,10 @@ fn main() {
     let mut terms = Terms::new();
     let mut n_bool_terms = 0;
     let mut phrases: Vec<Vec<u32>> = Vec::new();
-    let mut phrase_ids: std::collections::HashMap<Vec<u32>, u32> = std::collections::HashMap::new();
+    let mut phrase_ids: HashMap<Vec<u32>, u32> = HashMap::new();
     let mut queries = Vec::new();
     let mut bool_queries: Vec<Vec<(u8, u32)>> = Vec::new();
-    let mut bool_seen: std::collections::HashMap<Vec<(u8, u32)>, usize> =
-        std::collections::HashMap::new();
+    let mut bool_seen: HashMap<Vec<(u8, u32)>, usize> = HashMap::new();
     for line in qtext.split(|&c| c == b'\n').filter(|l| !l.is_empty()) {
         let (kind, rest) = line.split_at(line.iter().position(|&c| c == b' ').unwrap());
         let words: Vec<&[u8]> = rest[1..].split(|&c| c == b' ').collect();
@@ -680,16 +639,7 @@ fn main() {
         n_bool_terms < 1 << (32 - SHIFT),
         "too many BOOL terms to pack"
     );
-    let parts: Vec<Answers> = thread::scope(|sc| {
-        let handles: Vec<_> = split_lines(docs, threads)
-            .into_iter()
-            .map(|chunk| {
-                let ctx = &ctx;
-                sc.spawn(move || work(ctx, chunk))
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    let parts = par_map(split_lines(docs, threads), |chunk| work(&ctx, chunk));
 
     // Merge in thread order, which is id order: counts and sums add, and each slot's
     // first ten ids come from the earliest threads (each thread's list is in id order).

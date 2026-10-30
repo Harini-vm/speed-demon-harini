@@ -8,6 +8,7 @@ Every step from the reference to the final version, each with the live-board run
 | 1 | Rust rewrite: mmap, parallel hand parsing, counting-sort scatter, select_nth percentiles, parallel formatting | `7d3b2cd` | 0.074 | 61 | 300 | 21.06 | 66.175 |
 | 2 | Branch-free parsing; counts kept per thread during the parse | `155b431` | 0.047 | 55 | 353 | 26.43 | 71.109 |
 | 3 | The serial steps between phases made parallel | _fill in_ | | | | | |
+| 4 | Smaller source: the same logic in fewer lines | _fill in_ | | | | | |
 
 ## Step 1
 
@@ -52,3 +53,11 @@ A model of the box run (parse about 20 ms, scatter and percentiles about 8 ms, p
 - **Output.** Each formatting thread's buffer goes straight to its offset in the file with `write_all_at`, all at once.
 
 Correctness: identical SHA-256 to the reference on tiny seeds 1 to 12, sample seeds 1 to 7, full seeds 1 and 42, the worked example, an empty input, and with 1, 3, 7, 12 and 13 threads.
+
+## Step 4: source size
+
+Source size is 15% of the exponent, and this file was 398 code lines against the reference's few dozen. Same algorithms, same phases:
+
+The parallel sections shared one pattern, written out in full five times: spawn a thread per chunk, join, collect. A 6-line `par_map(items, f)` helper replaces each with one line. Endpoint ranks now use a stable sort over the concatenated per-thread sorted lists, which merges sorted runs in linear passes, instead of a hand-written merge loop. The 8-byte SWAR tier of `find_space` only ever handled the last bytes before a chunk boundary, which the plain byte search covers.
+
+398 to 344 code lines. Run time unchanged in alternating runs against the previous build. Correctness: identical SHA-256 to the reference on the full seed battery, the worked example, and with 1, 3 and 13 threads.

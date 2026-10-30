@@ -6,7 +6,8 @@ Every step from the reference to the final version, each with the live-board run
 |---|---|---|---|---|---|---|---|
 | 0 | The reference, unchanged (scoring-box calibration) | | 72.69 | 893 | 43 | 1 | 0 |
 | 1 | Rust: bucketed CSR, BFS renumbering, bidirectional Dijkstra with a radix heap, u32 distances | `155b431` | 0.252 | 203 | 435 | 16.12 | 60.373 |
-| 2 | SWAR number parsing, u32 heap keys, parallel renumbering bookkeeping | _fill in_ | | | | | |
+| 2 | SWAR number parsing, u32 heap keys, parallel renumbering bookkeeping | `5e6ffc1` | 0.236 | 199 | 482 | 16.50 | 60.873 |
+| 3 | Smaller source: the same logic in fewer lines | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -47,3 +48,13 @@ Board, step 1: T 288x faster contributes 16.98 to K, M 4.4x smaller contributes 
 Counting the search work (an instrumented build): 7.6 million nodes settled and 21 million edges relaxed over the 2,000 queries, against about 25 million settled for one-directional searches. The searches are already tight in node count; their cost is memory latency per node.
 
 Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, and with 1, 3 and 13 threads.
+
+Board, step 2: T 252 to 236 ms, but the source grew from 435 to 482 lines, which took back a third of the gain (the S factor fell from 0.707 to 0.697). The next step trims it.
+
+## Step 3: source size
+
+Source size is 15% of the exponent, and this file was 473 code lines against the reference's few dozen. Same algorithms, same phases:
+
+`par_map` for the seven parallel sections, and a `SharedPtr::set` method so each disjoint write is one line. Parsing reads `u v w` with one array expression, and the bidirectional search takes its two sides as one pair.
+
+473 to 427 code lines. Run time unchanged in alternating runs against the previous build. Correctness: identical SHA-256 to the reference on the full seed battery, the worked example, and with 1, 3 and 13 threads.

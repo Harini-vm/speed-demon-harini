@@ -83,7 +83,7 @@ fn first_in_word(w: u64, b: u8) -> usize {
     ((x.wrapping_sub(ONES) & !x & (ONES << 7)).trailing_zeros() / 8) as usize
 }
 
-/// Index of the first space at or after `i`: 32 bytes per step with AVX2, else 8.
+/// Index of the first space at or after `i`: 32 bytes per step with AVX2.
 #[inline(always)]
 fn find_space(buf: &[u8], mut i: usize) -> usize {
     #[cfg(target_feature = "avx2")]
@@ -99,14 +99,7 @@ fn find_space(buf: &[u8], mut i: usize) -> usize {
         }
         i += 32;
     }
-    while i + 8 <= buf.len() {
-        let k = first_in_word(word(buf, i), b' ');
-        if k < 8 {
-            return i + k;
-        }
-        i += 8;
-    }
-    i + buf[i..].iter().position(|&c| c == b' ').unwrap()
+    i + buf[i..].iter().position(|&c| c == b' ').unwrap() // the last bytes, or no AVX2
 }
 
 /// Parses the latency digits starting at `q`; returns (value, index of the LF).
@@ -213,17 +206,26 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
 
 /// Splits `buf` into `n` pieces that each end just after a newline.
 fn split_lines(buf: &[u8], n: usize) -> Vec<&[u8]> {
-    let mut out = Vec::with_capacity(n);
-    let mut start = 0;
+    let mut cuts = vec![0];
     for i in 1..=n {
-        let mut end = (buf.len() * i / n).max(start);
-        while end < buf.len() && (end == 0 || buf[end - 1] != b'\n') {
-            end += 1;
-        }
-        out.push(&buf[start..end]);
-        start = end;
+        let at = (buf.len() * i / n).max(*cuts.last().unwrap());
+        cuts.push(
+            buf[at..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(buf.len(), |k| at + k + 1),
+        );
     }
-    out
+    cuts.windows(2).map(|w| &buf[w[0]..w[1]]).collect()
+}
+
+/// Runs `f` on every item, one thread each, and returns the results in order.
+fn par_map<I: Send, T: Send>(items: Vec<I>, f: impl Fn(I) -> T + Sync) -> Vec<T> {
+    thread::scope(|sc| {
+        let f = &f;
+        let handles: Vec<_> = items.into_iter().map(|x| sc.spawn(move || f(x))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
 }
 
 fn push_u64(out: &mut Vec<u8>, mut v: u64) {
@@ -245,12 +247,19 @@ fn push_u64(out: &mut Vec<u8>, mut v: u64) {
 struct SharedPtr<T>(*mut T);
 unsafe impl<T> Send for SharedPtr<T> {}
 unsafe impl<T> Sync for SharedPtr<T> {}
+impl<T> SharedPtr<T> {
+    /// A pointer to element `i`. The caller guarantees `i` is in bounds and that no other
+    /// thread uses the same element.
+    fn at(self, i: usize) -> *mut T {
+        // SAFETY: in bounds, per the caller's guarantee.
+        unsafe { self.0.add(i) }
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", String::as_str);
     let out_dir = args.get(2).map_or("/out", String::as_str);
-
     let file = File::open(format!("{data_dir}/requests.log")).expect("open requests.log");
     let len = file.metadata().expect("stat").len() as usize;
     let out = File::create(format!("{out_dir}/summary.txt")).expect("create summary.txt");
@@ -270,130 +279,83 @@ fn main() {
         assert!(ptr as isize != -1, "mmap failed");
         std::slice::from_raw_parts(ptr, len)
     };
-
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
     let base_hour = days_from_civil(2026, 10, 30) * 24 + 18;
 
     // 1. Parse in parallel.
-    let mut parts: Vec<Parsed> = thread::scope(|sc| {
-        let handles: Vec<_> = split_lines(buf, threads)
-            .into_iter()
-            .map(|chunk| sc.spawn(move || parse(chunk, base_hour)))
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    let mut parts = par_map(split_lines(buf, threads), |chunk| parse(chunk, base_hour));
 
-    // 2. Global endpoint ranks, in byte order (slice Ord puts a proper prefix first). Only
-    //    each thread's ~1,842 names are sorted (in parallel, by the parse threads) and merged
-    //    here, and each thread maps its local ids to ranks (local_of: global rank -> local
-    //    id, or NONE) by binary search.
-    let mut all: Vec<&[u8]> = Vec::new();
-    for p in &parts {
-        // Merge two sorted, duplicate-free lists into one.
-        let mut merged = Vec::with_capacity(all.len() + p.sorted.len());
-        let (mut i, mut j) = (0, 0);
-        while i < all.len() || j < p.sorted.len() {
-            let next = if j == p.sorted.len() || (i < all.len() && all[i] <= p.sorted[j]) {
-                all[i]
-            } else {
-                p.sorted[j]
-            };
-            i += usize::from(i < all.len() && all[i] == next);
-            j += usize::from(j < p.sorted.len() && p.sorted[j] == next);
-            merged.push(next);
-        }
-        all = merged;
-    }
-    let n_eps = all.len();
-    let n_hours = parts.iter().map(|p| p.max_hour).max().unwrap_or(0) + 1;
+    // 2. Global endpoint ranks, in byte order (slice Ord puts a proper prefix first). Each
+    //    thread's names arrive sorted, and a stable sort merges sorted runs in linear passes.
+    //    Each thread then maps ranks to its local ids (NONE where it never saw the name).
+    let mut all: Vec<&[u8]> = parts
+        .iter()
+        .flat_map(|p| p.sorted.iter().copied())
+        .collect();
+    all.sort();
+    all.dedup();
+    let (n_eps, n_hours) = (
+        all.len(),
+        parts.iter().map(|p| p.max_hour).max().unwrap_or(0) + 1,
+    );
     let n_groups = n_hours * n_eps;
     const NONE: usize = usize::MAX;
-    let local_of: Vec<Vec<usize>> = thread::scope(|sc| {
-        let handles: Vec<_> = parts
+    let local_of = par_map(parts.iter().collect(), |p: &Parsed| {
+        let mut v = vec![NONE; n_eps];
+        p.names
             .iter()
-            .map(|p| {
-                let all = &all;
-                sc.spawn(move || {
-                    let mut v = vec![NONE; n_eps];
-                    for (id, n) in p.names.iter().enumerate() {
-                        v[all.binary_search(n).unwrap()] = id;
-                    }
-                    v
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+            .enumerate()
+            .for_each(|(id, n)| v[all.binary_search(n).unwrap()] = id);
+        v
     });
 
     // 3. Prefix sum in output order, by hour: each hour's line total, a running sum over
-    //    the hours, then every hour in parallel sets its groups' starts and turns each
+    //    the hours, then all hours in parallel set their groups' starts and turn each
     //    thread's cell counts into that thread's write cursors.
     let mut hour_start = vec![0u64; n_hours + 1];
     for h in 0..n_hours {
-        let lines: u64 = parts
+        let cells = parts
             .iter()
-            .flat_map(|p| &p.cells[h * EP_CAP..h * EP_CAP + p.names.len()])
-            .map(|c| c & 0xFFFF_FFFF)
-            .sum();
-        hour_start[h + 1] = hour_start[h] + lines;
+            .flat_map(|p| &p.cells[h * EP_CAP..h * EP_CAP + p.names.len()]);
+        hour_start[h + 1] = hour_start[h] + cells.map(|c| c & 0xFFFF_FFFF).sum::<u64>();
     }
     let total = hour_start[n_hours];
-    let mut start = vec![0u32; n_groups + 1];
+    let (mut start, mut errors) = (vec![0u32; n_groups + 1], vec![0u32; n_groups]);
     start[n_groups] = total as u32;
-    let mut errors = vec![0u32; n_groups];
     let cells: Vec<SharedPtr<u64>> = parts
         .iter_mut()
         .map(|p| SharedPtr(p.cells.as_mut_ptr()))
         .collect();
-    thread::scope(|sc| {
-        let (mut starts, mut errs) = (&mut start[..n_groups], &mut errors[..]);
-        for t in 0..threads {
-            let (h0, h1) = (n_hours * t / threads, n_hours * (t + 1) / threads);
-            let (my_starts, rest) = std::mem::take(&mut starts).split_at_mut((h1 - h0) * n_eps);
-            starts = rest;
-            let (my_errs, rest) = std::mem::take(&mut errs).split_at_mut((h1 - h0) * n_eps);
-            errs = rest;
-            let (cells, local_of, hour_start) = (&cells, &local_of, &hour_start);
-            sc.spawn(move || {
-                for h in h0..h1 {
-                    let mut total = hour_start[h];
-                    for r in 0..n_eps {
-                        let g = (h - h0) * n_eps + r;
-                        my_starts[g] = total as u32;
-                        for (cell, local) in cells.iter().zip(local_of) {
-                            if local[r] == NONE {
-                                continue;
-                            }
-                            // SAFETY: cell (h, local id) is touched only by the worker for hour h.
-                            let c = unsafe { &mut *cell.0.add(h * EP_CAP + local[r]) };
-                            if *c == 0 {
-                                continue; // no lines; writing would commit an untouched page
-                            }
-                            my_errs[g] += (*c >> 32) as u32;
-                            let lines = *c & 0xFFFF_FFFF;
-                            *c = total;
-                            total += lines;
-                        }
-                    }
+    let hours: Vec<_> = start[..n_groups]
+        .chunks_mut(n_eps)
+        .zip(errors.chunks_mut(n_eps))
+        .enumerate()
+        .collect();
+    par_map(hours, |(h, (starts, errs))| {
+        let mut total = hour_start[h];
+        for r in 0..n_eps {
+            starts[r] = total as u32;
+            for (cell, local) in cells.iter().zip(&local_of).filter(|(_, l)| l[r] != NONE) {
+                // SAFETY: cell (h, local id) is touched only by the worker for hour h.
+                let c = unsafe { &mut *cell.at(h * EP_CAP + local[r]) };
+                if *c != 0 {
+                    // (A zero cell is skipped: writing it would commit an untouched page.)
+                    errs[r] += (*c >> 32) as u32;
+                    (*c, total) = (total, total + (*c & 0xFFFF_FFFF));
                 }
-            });
+            }
         }
     });
 
     // 4. Scatter latencies so every group is contiguous, then free the per-line records.
     let mut lats = vec![0u32; total as usize];
     let dst = SharedPtr(lats.as_mut_ptr());
-    thread::scope(|sc| {
-        for p in parts.iter_mut() {
-            sc.spawn(move || {
-                let dst = dst;
-                for &r in &p.recs {
-                    let cursor = &mut p.cells[(r >> 32) as usize];
-                    // SAFETY: each (thread, group) owns its own disjoint index range.
-                    unsafe { *dst.0.add(*cursor as usize) = r as u32 };
-                    *cursor += 1;
-                }
-            });
+    par_map(parts.iter_mut().collect(), |p: &mut Parsed| {
+        for &r in &p.recs {
+            let cursor = &mut p.cells[(r >> 32) as usize];
+            // SAFETY: each (thread, group) owns its own disjoint index range.
+            unsafe { *dst.at(*cursor as usize) = r as u32 };
+            *cursor += 1;
         }
     });
     drop(parts);
@@ -401,78 +363,64 @@ fn main() {
     // 5. Percentiles and formatting, groups split into ranges of about equal latency count.
     let hour_text: Vec<String> = (0..n_hours as i64)
         .map(|h| {
-            let abs = base_hour + h;
-            let (y, m, d) = civil_from_days(abs.div_euclid(24));
-            format!("{y:04}-{m:02}-{d:02}T{:02}:00:00Z ", abs.rem_euclid(24))
+            let (y, m, d) = civil_from_days((base_hour + h).div_euclid(24));
+            format!(
+                "{y:04}-{m:02}-{d:02}T{:02}:00:00Z ",
+                (base_hour + h).rem_euclid(24)
+            )
         })
         .collect();
     let mut bounds = vec![0usize];
     for t in 1..threads {
-        let want = (u64::from(total) * t as u64 / threads as u64) as u32;
-        let g = start.partition_point(|&s| s < want).min(n_groups);
-        bounds.push(g.max(*bounds.last().unwrap()));
+        let g = start.partition_point(|&s| u64::from(s) < total * t as u64 / threads as u64);
+        bounds.push(g.min(n_groups).max(*bounds.last().unwrap()));
     }
     bounds.push(n_groups);
     let mut rest: &mut [u32] = &mut lats;
     let mut jobs = Vec::new();
     for w in bounds.windows(2) {
-        let size = (start[w[1]] - start[w[0]]) as usize;
-        let (mine, tail) = std::mem::take(&mut rest).split_at_mut(size);
+        let (mine, tail) =
+            std::mem::take(&mut rest).split_at_mut((start[w[1]] - start[w[0]]) as usize);
         rest = tail;
         jobs.push((w[0], w[1], mine));
     }
-    let outputs: Vec<Vec<u8>> = thread::scope(|sc| {
-        let (start, errors, all, hour_text) = (&start, &errors, &all, &hour_text);
-        let handles: Vec<_> = jobs
-            .into_iter()
-            .map(|(g0, g1, mine)| {
-                sc.spawn(move || {
-                    let mut o = Vec::with_capacity((g1 - g0) * 80);
-                    let base = start[g0];
-                    for g in g0..g1 {
-                        let n = (start[g + 1] - start[g]) as usize;
-                        if n == 0 {
-                            continue;
-                        }
-                        let v =
-                            &mut mine[(start[g] - base) as usize..(start[g + 1] - base) as usize];
-                        // Nearest rank: 1-indexed ceil(p*n/100). Select the largest rank first,
-                        // then search only below it for the smaller ones.
-                        let r = |p: usize| (p * n + 99) / 100 - 1;
-                        let (r50, r95, r99) = (r(50), r(95), r(99));
-                        let p99 = *v.select_nth_unstable(r99).1;
-                        let p95 = *v[..=r99].select_nth_unstable(r95).1;
-                        let p50 = *v[..=r95].select_nth_unstable(r50).1;
-                        let e = errors[g];
-                        o.extend_from_slice(hour_text[g / all.len()].as_bytes());
-                        o.extend_from_slice(all[g % all.len()]);
-                        for x in [
-                            n as u64,
-                            u64::from(p50),
-                            u64::from(p95),
-                            u64::from(p99),
-                            u64::from(e),
-                        ] {
-                            o.push(b' ');
-                            push_u64(&mut o, x);
-                        }
-                        o.push(b' ');
-                        push_u64(&mut o, u64::from(e) * 1_000_000 / n as u64);
-                        o.push(b'\n');
-                    }
-                    o
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    let outputs = par_map(jobs, |(g0, g1, mine)| {
+        let mut o = Vec::with_capacity((g1 - g0) * 80);
+        for g in g0..g1 {
+            let n = (start[g + 1] - start[g]) as usize;
+            if n == 0 {
+                continue;
+            }
+            let v = &mut mine[(start[g] - start[g0]) as usize..][..n];
+            // Nearest rank: 1-indexed ceil(p*n/100). Select the largest rank first, then
+            // search only below it for the smaller ones.
+            let r = |p: usize| (p * n + 99) / 100 - 1;
+            let p99 = *v.select_nth_unstable(r(99)).1;
+            let p95 = *v[..=r(99)].select_nth_unstable(r(95)).1;
+            let p50 = *v[..=r(95)].select_nth_unstable(r(50)).1;
+            let e = u64::from(errors[g]);
+            o.extend_from_slice(hour_text[g / n_eps].as_bytes());
+            o.extend_from_slice(all[g % n_eps]);
+            for x in [
+                n as u64,
+                p50.into(),
+                p95.into(),
+                p99.into(),
+                e,
+                e * 1_000_000 / n as u64,
+            ] {
+                o.push(b' ');
+                push_u64(&mut o, x);
+            }
+            o.push(b'\n');
+        }
+        o
     });
     // Every buffer goes straight to its place in the file, all at once.
-    let mut offset = 0;
-    thread::scope(|sc| {
-        for o in &outputs {
-            let (out, at) = (&out, offset);
-            sc.spawn(move || out.write_all_at(o, at).expect("write summary.txt"));
-            offset += o.len() as u64;
-        }
+    let offsets = outputs
+        .iter()
+        .scan(0, |at, o| Some(std::mem::replace(at, *at + o.len() as u64)));
+    par_map(outputs.iter().zip(offsets).collect(), |(o, at)| {
+        out.write_all_at(o, at).expect("write summary.txt")
     });
 }

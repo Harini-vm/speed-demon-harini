@@ -6,7 +6,8 @@ Every step from the reference to the final version, each with the live-board run
 |---|---|---|---|---|---|---|---|
 | 0 | The reference, unchanged (scoring-box calibration) | | 14.44 | 367 | 108 | 1 | 0 |
 | 1 | Rust: structural (AVX2 bitmask) CSV parsing, array join, shared lock-free name sets | `e8571e5` | 0.092 | 41 | 416 | 15.88 | 60.036 |
-| 2 | Country marks moved out of the shared table into private per-thread lists; regions read with plain iterators | _fill in_ | | | | | |
+| 2 | Country marks moved out of the shared table into private per-thread lists; regions read with plain iterators | `5e6ffc1` | 0.082 | 41 | 411 | 16.83 | 61.302 |
+| 3 | Smaller source: the same logic in fewer lines | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -38,3 +39,13 @@ Parsing alone is about 110 ms locally, about 25 ms of the box's 92, so the box s
 Now the shared table is only written when a name is first seen, and after warm-up it is read-only, so its lines stay shared by all cores. Each record carries a dense id, and each thread appends the id to a private per-country list: a sequential write nobody else touches. At the end one worker per country counts distinct ids, keeping in `last[id]` the last country that counted that name, so the array never needs clearing between countries.
 
 Local: 323 ms to 315 ms, which is expected on two cores; the effect is on the box. The regions file is now read with plain iterators instead of the AVX2 search, which only that small file used: 416 to 402 lines.
+
+Board, step 2: T 92 to 82 ms with 12 threads, the effect the 2-core machine could not show, and 416 to 411 lines.
+
+## Step 3: source size
+
+Source size is 15% of the exponent, and this file was 402 code lines against the reference's few dozen. Same algorithms, same phases:
+
+Region codes need no sort: a code's base-26 key orders like the code, so walking the 26^3 table in key order hands out ranks in output order. `par_map` for the parse threads and the distinct-count workers.
+
+402 to 385 code lines. Run time unchanged in alternating runs against the previous build. Correctness: identical SHA-256 to the reference on the full seed battery, the worked example, and with 1, 3 and 13 threads.

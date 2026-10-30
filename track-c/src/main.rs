@@ -344,6 +344,15 @@ fn split_records(buf: &[u8], n: usize) -> Vec<&[u8]> {
     cuts.windows(2).map(|w| &buf[w[0]..w[1]]).collect()
 }
 
+/// Runs `f` on every item, one thread each, and returns the results in order.
+fn par_map<I: Send, T: Send>(items: Vec<I>, f: impl Fn(I) -> T + Sync) -> Vec<T> {
+    thread::scope(|sc| {
+        let f = &f;
+        let handles: Vec<_> = items.into_iter().map(|x| sc.spawn(move || f(x))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
 /// Cents as `-?\d+\.\d\d`: -525 is "-5.25", -5 is "-0.05", 0 is "0.00".
 fn money(c: i64) -> String {
     let sign = if c < 0 { "-" } else { "" };
@@ -361,41 +370,37 @@ fn main() {
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
 
     // regions.csv: "region_id,country" lines after a header, ids ascending, codes [A-Z]{3}.
-    // Codes get provisional numbers from a direct 26^3 table, then ranks in sorted order.
+    // A code's base-26 key sorts like the code itself, so walking the 26^3 table in key
+    // order hands out ranks in output order with no sort.
     let regions = map(&format!("{data_dir}/regions.csv"));
-    let mut rows: Vec<(usize, u16)> = Vec::new();
-    let mut slot_of = vec![u16::MAX; 26 * 26 * 26];
-    let mut codes: Vec<&[u8]> = Vec::new();
-    for line in regions
-        .split(|&c| c == b'\n')
-        .skip(1)
-        .filter(|l| l.len() > 4)
-    {
-        let (id, code) = (
-            number(&line[..line.len() - 4]) as usize,
-            &line[line.len() - 3..],
+    let lines = || {
+        regions
+            .split(|&c| c == b'\n')
+            .skip(1)
+            .filter(|l| l.len() > 4)
+    };
+    let key = |l: &[u8]| {
+        l[l.len() - 3..]
+            .iter()
+            .fold(0, |k, &c| k * 26 + usize::from(c - b'A'))
+    };
+    let mut rank = vec![u8::MAX; 26 * 26 * 26];
+    lines().for_each(|l| rank[key(l)] = 0);
+    let mut codes: Vec<String> = Vec::new();
+    for (k, r) in rank.iter_mut().enumerate().filter(|(_, r)| **r == 0) {
+        assert!(codes.len() < 255, "more countries than a u8 rank holds");
+        *r = codes.len() as u8;
+        codes.push(
+            [k / 676, k / 26 % 26, k % 26]
+                .iter()
+                .map(|&c| (b'A' + c as u8) as char)
+                .collect(),
         );
-        let key = code.iter().fold(0, |k, &c| k * 26 + usize::from(c - b'A'));
-        if slot_of[key] == u16::MAX {
-            slot_of[key] = codes.len() as u16;
-            codes.push(code);
-        }
-        rows.push((id, slot_of[key]));
     }
-    let mut order: Vec<usize> = (0..codes.len()).collect();
-    order.sort_unstable_by_key(|&i| codes[i]);
-    let mut rank = vec![0u8; codes.len()];
-    order
-        .iter()
-        .enumerate()
-        .for_each(|(r, &i)| rank[i] = r as u8);
-    let codes: Vec<&[u8]> = order.iter().map(|&i| codes[i]).collect();
     let groups = codes.len() + 1; // the last group is _UNMATCHED
-    assert!(groups <= 256, "more countries than a u8 rank holds");
-    let mut country_of = vec![(groups - 1) as u8; rows.last().map_or(0, |r| r.0 + 1)];
-    for &(id, slot) in &rows {
-        country_of[id] = rank[slot as usize];
-    }
+    let id = |l: &[u8]| number(&l[..l.len() - 4]) as usize;
+    let mut country_of = vec![(groups - 1) as u8; lines().last().map_or(0, |l| id(l) + 1)];
+    lines().for_each(|l| country_of[id(l)] = rank[key(l)]);
 
     // records.csv: skip an optional BOM and the header line, then parse in parallel.
     let records = map(&format!("{data_dir}/records.csv"));
@@ -415,45 +420,28 @@ fn main() {
         ids: AtomicUsize::new(0),
     };
     let (country_of, names) = (&country_of, &names);
-    let parts: Vec<(Vec<Agg>, Vec<Vec<u32>>)> = thread::scope(|sc| {
-        let handles: Vec<_> = split_records(body, threads)
-            .into_iter()
-            .map(|chunk| sc.spawn(move || parse(chunk, country_of, names, groups)))
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    let parts = par_map(split_records(body, threads), |chunk| {
+        parse(chunk, country_of, names, groups)
     });
 
     // Distinct names per country, one country at a time per worker. `last[id]` is the last
     // country that counted name `id`, so it never needs clearing between countries.
-    let next = AtomicUsize::new(0);
-    let n_ids = names.ids.load(Relaxed);
-    let mut distinct = vec![0u32; groups];
-    let found: Vec<Vec<(usize, u32)>> = thread::scope(|sc| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                let (parts, next) = (&parts, &next);
-                sc.spawn(move || {
-                    let mut last = vec![u16::MAX; n_ids];
-                    let mut out = Vec::new();
-                    loop {
-                        let g = next.fetch_add(1, Relaxed);
-                        if g >= groups {
-                            break;
-                        }
-                        let mut n = 0;
-                        for id in parts.iter().flat_map(|p| &p.1[g]) {
-                            if last[*id as usize] != g as u16 {
-                                last[*id as usize] = g as u16;
-                                n += 1;
-                            }
-                        }
-                        out.push((g, n));
-                    }
-                    out
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    let (next, n_ids) = (AtomicUsize::new(0), names.ids.load(Relaxed));
+    let mut distinct = vec![0usize; groups];
+    let found = par_map(vec![(); threads], |()| {
+        let (mut last, mut out) = (vec![u16::MAX; n_ids], Vec::new());
+        loop {
+            let g = next.fetch_add(1, Relaxed);
+            if g >= groups {
+                return out;
+            }
+            let ids = parts.iter().flat_map(|p| &p.1[g]).map(|&id| id as usize);
+            out.push((
+                g,
+                ids.filter(|&id| std::mem::replace(&mut last[id], g as u16) != g as u16)
+                    .count(),
+            ));
+        }
     });
     found
         .into_iter()
@@ -466,9 +454,7 @@ fn main() {
         if a.count == 0 {
             continue;
         }
-        let key = codes
-            .get(g)
-            .map_or("_UNMATCHED", |c| std::str::from_utf8(c).unwrap());
+        let key = codes.get(g).map_or("_UNMATCHED", String::as_str);
         text += &format!(
             "{key} {} {} {} {} {} {} {} {}\n",
             a.count,

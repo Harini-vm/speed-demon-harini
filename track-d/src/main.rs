@@ -95,17 +95,26 @@ fn number_fast(buf: &[u8], i: &mut usize) -> u64 {
 
 /// Splits `buf` into `n` pieces that each end just after a newline.
 fn split_lines(buf: &[u8], n: usize) -> Vec<&[u8]> {
-    let mut out = Vec::with_capacity(n);
-    let mut start = 0;
+    let mut cuts = vec![0];
     for i in 1..=n {
-        let mut end = (buf.len() * i / n).max(start);
-        while end < buf.len() && (end == 0 || buf[end - 1] != b'\n') {
-            end += 1;
-        }
-        out.push(&buf[start..end]);
-        start = end;
+        let at = (buf.len() * i / n).max(*cuts.last().unwrap());
+        cuts.push(
+            buf[at..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(buf.len(), |k| at + k + 1),
+        );
     }
-    out
+    cuts.windows(2).map(|w| &buf[w[0]..w[1]]).collect()
+}
+
+/// Runs `f` on every item, one thread each, and returns the results in order.
+fn par_map<I: Send, T: Send>(items: Vec<I>, f: impl Fn(I) -> T + Sync) -> Vec<T> {
+    thread::scope(|sc| {
+        let f = &f;
+        let handles: Vec<_> = items.into_iter().map(|x| sc.spawn(move || f(x))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
 }
 
 /// A raw pointer that threads may share when they provably write disjoint indices.
@@ -113,6 +122,14 @@ fn split_lines(buf: &[u8], n: usize) -> Vec<&[u8]> {
 struct SharedPtr<T>(*mut T);
 unsafe impl<T> Send for SharedPtr<T> {}
 unsafe impl<T> Sync for SharedPtr<T> {}
+impl<T> SharedPtr<T> {
+    /// Writes element `i`. The caller guarantees `i` is in bounds and that no other thread
+    /// writes the same element.
+    fn set(self, i: usize, v: T) {
+        // SAFETY: in bounds and unshared, per the caller's guarantee.
+        unsafe { *self.0.add(i) = v }
+    }
+}
 
 /// The graph in CSR form: the out-edges of `u` are `adj[off[u]..off[u + 1]]`.
 struct Graph {
@@ -131,27 +148,17 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     assert!(m < u32::MAX as usize, "edge count must fit in u32");
     let nb = (n >> SHIFT) + 1;
     // Parse straight into buckets by tail; self-loops never shorten a path, so drop them.
-    let parts: Vec<Vec<Vec<[u32; 3]>>> = thread::scope(|sc| {
-        let handles: Vec<_> = split_lines(&text[i..], threads)
-            .into_iter()
-            .map(|chunk| {
-                sc.spawn(move || {
-                    let expect = chunk.len() / 18 / nb; // ~18 bytes per edge line
-                    let mut buckets = vec![Vec::with_capacity(expect + expect / 4 + 16); nb];
-                    let mut j = 0;
-                    while j < chunk.len() {
-                        let u = number_fast(chunk, &mut j) as u32;
-                        let v = number_fast(chunk, &mut j) as u32;
-                        let w = number_fast(chunk, &mut j) as u32;
-                        if u != v {
-                            buckets[(u >> SHIFT) as usize].push([u, v, w]);
-                        }
-                    }
-                    buckets
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    let parts = par_map(split_lines(&text[i..], threads), |chunk| {
+        let expect = chunk.len() / 18 / nb; // ~18 bytes per edge line
+        let mut buckets = vec![Vec::with_capacity(expect + expect / 4 + 16); nb];
+        let mut j = 0;
+        while j < chunk.len() {
+            let [u, v, w] = [0; 3].map(|_| number_fast(chunk, &mut j) as u32);
+            if u != v {
+                buckets[(u >> SHIFT) as usize].push([u, v, w]);
+            }
+        }
+        buckets
     });
     let mut base = vec![0usize; nb + 1];
     for b in 0..nb {
@@ -165,37 +172,27 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     let mut adj = vec![(0u32, 0u32); base[nb]];
     let (offp, adjp) = (SharedPtr(off.as_mut_ptr()), SharedPtr(adj.as_mut_ptr()));
     let next = AtomicUsize::new(0);
-    thread::scope(|sc| {
-        for _ in 0..threads {
-            let (parts, base, next) = (&parts, &base, &next);
-            sc.spawn(move || {
-                let (offp, adjp) = (offp, adjp);
-                let mut cursor = vec![0u32; 1 << SHIFT];
-                loop {
-                    let b = next.fetch_add(1, Relaxed);
-                    if b >= nb {
-                        break;
-                    }
-                    let lo = b << SHIFT;
-                    let hi = (lo + (1 << SHIFT)).min(n);
-                    cursor.fill(0);
-                    for &[u, _, _] in parts.iter().flat_map(|p| &p[b]) {
-                        cursor[u as usize - lo] += 1;
-                    }
-                    let mut c = base[b] as u32;
-                    for k in 0..hi - lo {
-                        // SAFETY: nodes lo..hi belong to this bucket alone.
-                        unsafe { *offp.0.add(lo + k) = c };
-                        (cursor[k], c) = (c, c + cursor[k]);
-                    }
-                    for &[u, v, w] in parts.iter().flat_map(|p| &p[b]) {
-                        let k = &mut cursor[u as usize - lo];
-                        // SAFETY: slots base[b]..base[b + 1] belong to this bucket alone.
-                        unsafe { *adjp.0.add(*k as usize) = (v, w) };
-                        *k += 1;
-                    }
-                }
+    par_map(vec![(); threads], |()| {
+        let mut cursor = vec![0u32; 1 << SHIFT];
+        loop {
+            let b = next.fetch_add(1, Relaxed);
+            if b >= nb {
+                break;
+            }
+            let (lo, edges) = (b << SHIFT, || {
+                parts.iter().flat_map(|p: &Vec<Vec<[u32; 3]>>| &p[b])
             });
+            cursor.fill(0);
+            edges().for_each(|&[u, _, _]| cursor[u as usize - lo] += 1);
+            let mut c = base[b] as u32;
+            for k in 0..(lo + (1 << SHIFT)).min(n) - lo {
+                offp.set(lo + k, c); // nodes lo.. belong to this bucket alone
+                (cursor[k], c) = (c, c + cursor[k]);
+            }
+            for &[u, v, w] in edges() {
+                adjp.set(cursor[u as usize - lo] as usize, (v, w)); // so do its edge slots
+                cursor[u as usize - lo] += 1;
+            }
         }
     });
     Graph { off, adj }
@@ -212,33 +209,21 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
     let n = g.off.len() - 1;
     let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let claim = |x: usize| !claimed[x].load(Relaxed) && !claimed[x].swap(true, Relaxed);
-    let orders: Vec<Vec<u32>> = thread::scope(|sc| {
-        let handles: Vec<_> = (0..threads)
-            .map(|t| {
-                let (g, claim) = (&g, &claim);
-                sc.spawn(move || {
-                    let mut order: Vec<u32> = Vec::with_capacity(n / threads + n / threads / 4);
-                    for root in n * t / threads..n * (t + 1) / threads {
-                        if !claim(root) {
-                            continue;
-                        }
-                        let mut head = order.len();
-                        order.push(root as u32);
-                        while head < order.len() {
-                            let u = order[head] as usize;
-                            head += 1;
-                            for &(v, _) in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
-                                if claim(v as usize) {
-                                    order.push(v);
-                                }
-                            }
-                        }
-                    }
-                    order
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    let orders = par_map((0..threads).collect(), |t| {
+        let mut order: Vec<u32> = Vec::with_capacity(n / threads + n / threads / 4);
+        for root in (n * t / threads..n * (t + 1) / threads).filter(|&r| claim(r)) {
+            let mut head = order.len();
+            order.push(root as u32);
+            while head < order.len() {
+                let u = order[head] as usize;
+                head += 1;
+                let next = g.adj[g.off[u] as usize..g.off[u + 1] as usize]
+                    .iter()
+                    .map(|e| e.0);
+                order.extend(next.filter(|&v| claim(v as usize)));
+            }
+        }
+        order
     });
     drop(claimed);
     let order: Vec<u32> = orders.concat();
@@ -248,21 +233,11 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
     let mut new_id = vec![0u32; n];
     let mut off = vec![0u32; n + 1];
     let (idp, degp) = (SharedPtr(new_id.as_mut_ptr()), SharedPtr(off.as_mut_ptr()));
-    thread::scope(|sc| {
-        for t in 0..threads {
-            let (order, g) = (&order, &g);
-            sc.spawn(move || {
-                let (idp, degp) = (idp, degp);
-                for k in n * t / threads..n * (t + 1) / threads {
-                    let u = order[k] as usize;
-                    // SAFETY: k (and so u, since order is a permutation) belongs to this
-                    // thread alone.
-                    unsafe {
-                        *idp.0.add(u) = k as u32;
-                        *degp.0.add(k + 1) = g.off[u + 1] - g.off[u];
-                    }
-                }
-            });
+    par_map((0..threads).collect(), |t| {
+        for k in n * t / threads..n * (t + 1) / threads {
+            let u = order[k] as usize; // order is a permutation, so u is this thread's alone
+            idp.set(u, k as u32);
+            degp.set(k + 1, g.off[u + 1] - g.off[u]);
         }
     });
     for k in 0..n {
@@ -271,22 +246,19 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
     // Copy each node's edge list to its new place, in parallel over ranges of new ids.
     let mut adj = vec![(0u32, 0u32); g.adj.len()];
     let mut rest: &mut [(u32, u32)] = &mut adj;
-    thread::scope(|sc| {
-        for t in 0..threads {
-            let (k0, k1) = (n * t / threads, n * (t + 1) / threads);
-            let (mine, tail) = std::mem::take(&mut rest).split_at_mut((off[k1] - off[k0]) as usize);
-            rest = tail;
-            let (g, order, new_id, off) = (&g, &order, &new_id, &off);
-            sc.spawn(move || {
-                for k in k0..k1 {
-                    let u = order[k] as usize;
-                    let src = &g.adj[g.off[u] as usize..g.off[u + 1] as usize];
-                    let base = (off[k] - off[k0]) as usize;
-                    for (slot, &(v, w)) in mine[base..base + src.len()].iter_mut().zip(src) {
-                        *slot = (new_id[v as usize], w);
-                    }
-                }
-            });
+    let mut jobs = Vec::new();
+    for t in 0..threads {
+        let (k0, k1) = (n * t / threads, n * (t + 1) / threads);
+        let (mine, tail) = std::mem::take(&mut rest).split_at_mut((off[k1] - off[k0]) as usize);
+        rest = tail;
+        jobs.push((k0, k1, mine));
+    }
+    par_map(jobs, |(k0, k1, mine)| {
+        let mut slots = mine.iter_mut();
+        for &u in &order[k0..k1] {
+            for &(v, w) in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize] {
+                *slots.next().unwrap() = (new_id[v as usize], w);
+            }
         }
     });
     (Graph { off, adj }, new_id)
@@ -349,15 +321,12 @@ impl RadixHeap {
 fn reverse(g: &Graph, threads: usize) -> Graph {
     let n = g.off.len() - 1;
     let indeg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-    let ranges = |t: usize| n * t / threads..n * (t + 1) / threads;
-    thread::scope(|sc| {
-        for t in 0..threads {
-            let (indeg, range) = (&indeg, ranges(t));
-            sc.spawn(move || {
-                for &(v, _) in &g.adj[g.off[range.start] as usize..g.off[range.end] as usize] {
-                    indeg[v as usize].fetch_add(1, Relaxed);
-                }
-            });
+    let ranges: Vec<_> = (0..threads)
+        .map(|t| n * t / threads..n * (t + 1) / threads)
+        .collect();
+    par_map(ranges.clone(), |r| {
+        for &(v, _) in &g.adj[g.off[r.start] as usize..g.off[r.end] as usize] {
+            indeg[v as usize].fetch_add(1, Relaxed);
         }
     });
     let mut off = vec![0u32; n + 1];
@@ -367,19 +336,15 @@ fn reverse(g: &Graph, threads: usize) -> Graph {
     }
     let mut adj = vec![(0u32, 0u32); g.adj.len()];
     let dst = SharedPtr(adj.as_mut_ptr());
-    thread::scope(|sc| {
-        for t in 0..threads {
-            let (indeg, range) = (&indeg, ranges(t));
-            sc.spawn(move || {
-                let dst = dst;
-                for u in range {
-                    for &(v, w) in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
-                        let k = indeg[v as usize].fetch_add(1, Relaxed) as usize;
-                        // SAFETY: fetch_add hands every in-edge its own slot.
-                        unsafe { *dst.0.add(k) = (u as u32, w) };
-                    }
-                }
-            });
+    par_map(ranges, |r| {
+        for u in r {
+            for &(v, w) in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
+                // fetch_add hands every in-edge its own slot
+                dst.set(
+                    indeg[v as usize].fetch_add(1, Relaxed) as usize,
+                    (u as u32, w),
+                );
+            }
         }
     });
     Graph { off, adj }
@@ -448,19 +413,18 @@ impl Side {
     }
 }
 
-/// Bidirectional Dijkstra: forward from `s` in `fwd`, backward from `t` in `bwd`, always
+/// Bidirectional Dijkstra: forward from `s` in `g`, backward from `t` in `r`, always
 /// growing the side with fewer queued entries (growing by smaller key would let one side
 /// flood the graph when the other starts with an edge of weight near 2^32). Once the two
 /// next keys add up to at least the best path seen, no shorter path can exist.
-/// Returns Err(()) if a distance left u32, else the distance or None if unreachable.
+/// Returns None if a distance left u32, else Some(the distance, or None if unreachable).
 fn shortest(
-    fwd: &Graph,
-    bwd: &Graph,
-    f: &mut Side,
-    b: &mut Side,
+    g: &Graph,
+    r: &Graph,
+    (f, b): &mut (Side, Side),
     s: u32,
     t: u32,
-) -> Result<Option<u64>, ()> {
+) -> Option<Option<u64>> {
     let (mut best, mut wide) = (u64::MAX, false);
     f.start(s);
     b.start(t);
@@ -469,17 +433,14 @@ fn shortest(
             break;
         }
         if f.heap.len <= b.heap.len {
-            f.step(fwd, &b.dist, &mut best, &mut wide);
+            f.step(g, &b.dist, &mut best, &mut wide);
         } else {
-            b.step(bwd, &f.dist, &mut best, &mut wide);
+            b.step(r, &f.dist, &mut best, &mut wide);
         }
     }
     f.reset();
     b.reset();
-    if wide {
-        return Err(());
-    }
-    Ok((best != u64::MAX).then_some(best))
+    (!wide).then_some((best != u64::MAX).then_some(best))
 }
 
 /// Plain Dijkstra with 64-bit distances in a hash map, for the rare query whose distances
@@ -538,29 +499,23 @@ fn main() {
         .chunks(queries.len().div_ceil(threads * 2).max(1))
         .collect();
     let answers: Vec<AtomicI64> = queries.iter().map(|_| AtomicI64::new(-1)).collect();
-    let next = AtomicUsize::new(0);
-    let n = g.off.len() - 1;
+    let (next, n) = (AtomicUsize::new(0), g.off.len() - 1);
     let no_edges = |g: &Graph, x: usize| g.off[x] == g.off[x + 1];
-    thread::scope(|sc| {
-        for _ in 0..threads {
-            sc.spawn(|| {
-                let mut sides: Option<(Side, Side)> = None;
-                while let Some(run) = runs.get(next.fetch_add(1, Relaxed)) {
-                    for &q in *run {
-                        let (s, t) = queries[q];
-                        let answer = if s == t {
-                            Some(0)
-                        } else if no_edges(&g, s as usize) || no_edges(&rev, t as usize) {
-                            None // no way out of s, or no way into t
-                        } else {
-                            let (f, b) = sides.get_or_insert_with(|| (Side::new(n), Side::new(n)));
-                            shortest(&g, &rev, f, b, s, t)
-                                .unwrap_or_else(|()| shortest_wide(&g, s, t))
-                        };
-                        answers[q].store(answer.map_or(-1, |d| d as i64), Relaxed);
-                    }
-                }
-            });
+    par_map(vec![(); threads], |()| {
+        let mut sides: Option<(Side, Side)> = None;
+        while let Some(run) = runs.get(next.fetch_add(1, Relaxed)) {
+            for &q in *run {
+                let (s, t) = queries[q];
+                let answer = if s == t {
+                    Some(0)
+                } else if no_edges(&g, s as usize) || no_edges(&rev, t as usize) {
+                    None // no way out of s, or no way into t
+                } else {
+                    let sides = sides.get_or_insert_with(|| (Side::new(n), Side::new(n)));
+                    shortest(&g, &rev, sides, s, t).unwrap_or_else(|| shortest_wide(&g, s, t))
+                };
+                answers[q].store(answer.map_or(-1, |d| d as i64), Relaxed);
+            }
         }
     });
 
