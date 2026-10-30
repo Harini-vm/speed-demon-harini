@@ -12,10 +12,9 @@
 //! 5. Per group, nearest-rank percentiles with select_nth_unstable (no full sort), and
 //!    format the lines in parallel. Write the buffers out in order.
 
-use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::thread;
 
 /// A thread's cell for (hour, local endpoint id) is `hour * EP_CAP + id`. The spec fixes the
@@ -60,6 +59,8 @@ fn digits(b: &[u8]) -> i64 {
 /// One thread's parse result. Endpoint ids are local to the thread.
 struct Parsed<'a> {
     names: Vec<&'a [u8]>,
+    /// The same names, sorted bytewise (done here, in parallel, for the merge in main).
+    sorted: Vec<&'a [u8]>,
     /// Per line: cell << 32 | latency.
     recs: Vec<u64>,
     /// Per cell: errors << 32 | lines. Allocated zeroed, so untouched pages cost nothing.
@@ -199,8 +200,11 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
         recs.push((cell as u64) << 32 | lat);
         p = nl + 1;
     }
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
     Parsed {
         names,
+        sorted,
         recs,
         cells,
         max_hour,
@@ -238,9 +242,9 @@ fn push_u64(out: &mut Vec<u8>, mut v: u64) {
 
 /// A raw pointer that threads may share when they provably write disjoint indices.
 #[derive(Clone, Copy)]
-struct SharedPtr(*mut u32);
-unsafe impl Send for SharedPtr {}
-unsafe impl Sync for SharedPtr {}
+struct SharedPtr<T>(*mut T);
+unsafe impl<T> Send for SharedPtr<T> {}
+unsafe impl<T> Sync for SharedPtr<T> {}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -249,7 +253,7 @@ fn main() {
 
     let file = File::open(format!("{data_dir}/requests.log")).expect("open requests.log");
     let len = file.metadata().expect("stat").len() as usize;
-    let mut out = File::create(format!("{out_dir}/summary.txt")).expect("create summary.txt");
+    let out = File::create(format!("{out_dir}/summary.txt")).expect("create summary.txt");
     if len == 0 {
         return;
     }
@@ -279,50 +283,102 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    // 2. Global endpoint ranks, in byte order (slice Ord puts a proper prefix first).
-    let mut all: Vec<&[u8]> = parts.iter().flat_map(|p| p.names.iter().copied()).collect();
-    all.sort_unstable();
-    all.dedup();
-    let rank: HashMap<&[u8], usize> = all.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+    // 2. Global endpoint ranks, in byte order (slice Ord puts a proper prefix first). Only
+    //    each thread's ~1,842 names are sorted (in parallel, by the parse threads) and merged
+    //    here, and each thread maps its local ids to ranks (local_of: global rank -> local
+    //    id, or NONE) by binary search.
+    let mut all: Vec<&[u8]> = Vec::new();
+    for p in &parts {
+        // Merge two sorted, duplicate-free lists into one.
+        let mut merged = Vec::with_capacity(all.len() + p.sorted.len());
+        let (mut i, mut j) = (0, 0);
+        while i < all.len() || j < p.sorted.len() {
+            let next = if j == p.sorted.len() || (i < all.len() && all[i] <= p.sorted[j]) {
+                all[i]
+            } else {
+                p.sorted[j]
+            };
+            i += usize::from(i < all.len() && all[i] == next);
+            j += usize::from(j < p.sorted.len() && p.sorted[j] == next);
+            merged.push(next);
+        }
+        all = merged;
+    }
     let n_eps = all.len();
     let n_hours = parts.iter().map(|p| p.max_hour).max().unwrap_or(0) + 1;
     let n_groups = n_hours * n_eps;
-    // For each thread: global rank -> local id, or NONE if the thread never saw it.
     const NONE: usize = usize::MAX;
-    let local_of: Vec<Vec<usize>> = parts
-        .iter()
-        .map(|p| {
-            let mut v = vec![NONE; n_eps];
-            p.names
-                .iter()
-                .enumerate()
-                .for_each(|(id, n)| v[rank[n]] = id);
-            v
-        })
-        .collect();
+    let local_of: Vec<Vec<usize>> = thread::scope(|sc| {
+        let handles: Vec<_> = parts
+            .iter()
+            .map(|p| {
+                let all = &all;
+                sc.spawn(move || {
+                    let mut v = vec![NONE; n_eps];
+                    for (id, n) in p.names.iter().enumerate() {
+                        v[all.binary_search(n).unwrap()] = id;
+                    }
+                    v
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
 
-    // 3. Prefix sum in output order. Each thread's cell count becomes its write cursor.
-    let mut start = vec![0u32; n_groups + 1];
-    let mut errors = vec![0u32; n_groups];
-    let mut total = 0u64;
+    // 3. Prefix sum in output order, by hour: each hour's line total, a running sum over
+    //    the hours, then every hour in parallel sets its groups' starts and turns each
+    //    thread's cell counts into that thread's write cursors.
+    let mut hour_start = vec![0u64; n_hours + 1];
     for h in 0..n_hours {
-        for r in 0..n_eps {
-            let g = h * n_eps + r;
-            start[g] = total as u32;
-            for (p, local) in parts.iter_mut().zip(&local_of) {
-                if local[r] != NONE {
-                    let c = &mut p.cells[h * EP_CAP + local[r]];
-                    if *c != 0 {
-                        errors[g] += (*c >> 32) as u32;
-                        let lines = *c & 0xFFFF_FFFF;
-                        *c = total;
-                        total += lines;
+        let lines: u64 = parts
+            .iter()
+            .flat_map(|p| &p.cells[h * EP_CAP..h * EP_CAP + p.names.len()])
+            .map(|c| c & 0xFFFF_FFFF)
+            .sum();
+        hour_start[h + 1] = hour_start[h] + lines;
+    }
+    let total = hour_start[n_hours];
+    let mut start = vec![0u32; n_groups + 1];
+    start[n_groups] = total as u32;
+    let mut errors = vec![0u32; n_groups];
+    let cells: Vec<SharedPtr<u64>> = parts
+        .iter_mut()
+        .map(|p| SharedPtr(p.cells.as_mut_ptr()))
+        .collect();
+    thread::scope(|sc| {
+        let (mut starts, mut errs) = (&mut start[..n_groups], &mut errors[..]);
+        for t in 0..threads {
+            let (h0, h1) = (n_hours * t / threads, n_hours * (t + 1) / threads);
+            let (my_starts, rest) = std::mem::take(&mut starts).split_at_mut((h1 - h0) * n_eps);
+            starts = rest;
+            let (my_errs, rest) = std::mem::take(&mut errs).split_at_mut((h1 - h0) * n_eps);
+            errs = rest;
+            let (cells, local_of, hour_start) = (&cells, &local_of, &hour_start);
+            sc.spawn(move || {
+                for h in h0..h1 {
+                    let mut total = hour_start[h];
+                    for r in 0..n_eps {
+                        let g = (h - h0) * n_eps + r;
+                        my_starts[g] = total as u32;
+                        for (cell, local) in cells.iter().zip(local_of) {
+                            if local[r] == NONE {
+                                continue;
+                            }
+                            // SAFETY: cell (h, local id) is touched only by the worker for hour h.
+                            let c = unsafe { &mut *cell.0.add(h * EP_CAP + local[r]) };
+                            if *c == 0 {
+                                continue; // no lines; writing would commit an untouched page
+                            }
+                            my_errs[g] += (*c >> 32) as u32;
+                            let lines = *c & 0xFFFF_FFFF;
+                            *c = total;
+                            total += lines;
+                        }
                     }
                 }
-            }
+            });
         }
-    }
-    start[n_groups] = total as u32;
+    });
 
     // 4. Scatter latencies so every group is contiguous, then free the per-line records.
     let mut lats = vec![0u32; total as usize];
@@ -410,7 +466,13 @@ fn main() {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    for o in &outputs {
-        out.write_all(o).expect("write summary.txt");
-    }
+    // Every buffer goes straight to its place in the file, all at once.
+    let mut offset = 0;
+    thread::scope(|sc| {
+        for o in &outputs {
+            let (out, at) = (&out, offset);
+            sc.spawn(move || out.write_all_at(o, at).expect("write summary.txt"));
+            offset += o.len() as u64;
+        }
+    });
 }

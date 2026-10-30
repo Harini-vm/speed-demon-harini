@@ -7,6 +7,7 @@ Every step from the reference to the final version, each with the live-board run
 | 0 | The reference, unchanged (scoring-box calibration) | | 32.05 | 228 | 56 | 1 | 0 |
 | 1 | Rust rewrite: mmap, parallel hand parsing, counting-sort scatter, select_nth percentiles, parallel formatting | `7d3b2cd` | 0.074 | 61 | 300 | 21.06 | 66.175 |
 | 2 | Branch-free parsing; counts kept per thread during the parse | `155b431` | 0.047 | 55 | 353 | 26.43 | 71.109 |
+| 3 | The serial steps between phases made parallel | _fill in_ | | | | | |
 
 ## Step 1
 
@@ -32,3 +33,22 @@ Merge and memory:
 Local result, full seed 1: 179 ms to 118 ms (min of 11). Anonymous memory forced to 12 threads: 45 MB to 39 MB peak. The board's M also counts the 10 MB output file in the page cache, so expect about 55 MB there. The board measured exactly 55 MB, and T fell from 74 ms to 47 ms (1.57x, close to the 1.5x seen locally).
 
 Correctness after this step: identical SHA-256 to the reference on tiny seeds 1 to 12, sample seeds 1 to 7, full seeds 1 and 42, the spec's worked example and an empty input, and on samples run with 1, 3, 7, 12 and 13 threads (chunk boundaries move with the thread count).
+
+## Step 3
+
+The box runs 12 threads, the dev machine 2, so a step that runs on one thread costs relatively more on the box than it does here. I built a copy forced to 12 threads and timed each phase. Parallel phases look inflated on 2 cores, but single-threaded ones show their real cost, and it grows with the thread count:
+
+| Serial step | Cost at 12 threads | What it did |
+|---|---|---|
+| Endpoint ranks | ~5 ms | sorted about 22,000 names (1,842 per thread x 12), then std `HashMap` lookups |
+| Prefix sum | ~5.5 ms | 132,000 groups x 12 threads, one cell at a time |
+| Output write | ~2.5 ms | 10 MB copied by one thread |
+
+A model of the box run (parse about 20 ms, scatter and percentiles about 8 ms, plus these 13 ms) matched the measured 46 ms.
+
+- **Ranks.** Each parse thread sorts its own names at the end of its parse, and main does a linear dedup-merge of the sorted lists: 1.7 ms. Each thread maps its local ids to ranks by binary search, in parallel.
+- **Prefix sum by hour.** Each hour's total line count first (a sequential read), then a running sum over 72 hours, then every hour in parallel sets its groups' starts and turns each thread's cell counts into cursors. Cells belong to exactly one hour, so the workers never touch the same cell.
+  - Tried and fixed: the first version wrote every cell, including empty ones. Writing a zero cell in a page nobody had touched commits that page, and that alone took the step to 34 ms. Skipping empty cells, as the serial version did, brought it back.
+- **Output.** Each formatting thread's buffer goes straight to its offset in the file with `write_all_at`, all at once.
+
+Correctness: identical SHA-256 to the reference on tiny seeds 1 to 12, sample seeds 1 to 7, full seeds 1 and 42, the worked example, an empty input, and with 1, 3, 7, 12 and 13 threads.
