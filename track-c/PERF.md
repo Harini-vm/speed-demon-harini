@@ -5,7 +5,8 @@ Every step from the reference to the final version, each with the live-board run
 | Step | Change | Board run (commit) | T (s) | M (MB) | Lines | K | Points |
 |---|---|---|---|---|---|---|---|
 | 0 | The reference, unchanged (scoring-box calibration) | | 14.44 | 367 | 108 | 1 | 0 |
-| 1 | Rust: structural (AVX2 bitmask) CSV parsing, array join, shared lock-free name sets | _fill in_ | | | | | |
+| 1 | Rust: structural (AVX2 bitmask) CSV parsing, array join, shared lock-free name sets | `e8571e5` | 0.092 | 41 | 416 | 15.88 | 60.036 |
+| 2 | Country marks moved out of the shared table into private per-thread lists; regions read with plain iterators | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -27,3 +28,13 @@ Single eliminations did not add up (interning alone about 55 ms, bitsets alone a
 ### Memory
 
 Peak RSS is about 210 MB locally, of which about 204 MB is the mapped input, which the box's harness does not charge. The name storage is sized for the worst case (every record a new name) but allocated zeroed, so only the pages actually used are committed.
+
+Board, step 1: T 157x faster contributes 12.53 to K, M 9x smaller contributes 1.55, and 416 lines (3.9x the reference) costs 0.82. Local 323 ms on 2 cores became 92 ms on 12 threads, only 3.5x for 6x the cores: the next step looks at the shared name table, whose country masks every thread writes.
+
+## Step 2
+
+Parsing alone is about 110 ms locally, about 25 ms of the box's 92, so the box spent most of its time on names. Every thread wrote country bits into the shared name records, and each write invalidates that cache line in every other core's cache, so the dictionary's lines bounced between cores. Two local cores cannot show that; twelve can.
+
+Now the shared table is only written when a name is first seen, and after warm-up it is read-only, so its lines stay shared by all cores. Each record carries a dense id, and each thread appends the id to a private per-country list: a sequential write nobody else touches. At the end one worker per country counts distinct ids, keeping in `last[id]` the last country that counted that name, so the array never needs clearing between countries.
+
+Local: 323 ms to 315 ms, which is expected on two cores; the effect is on the box. The regions file is now read with plain iterators instead of the AVX2 search, which only that small file used: 416 to 402 lines.

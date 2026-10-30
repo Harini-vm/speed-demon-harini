@@ -36,39 +36,6 @@ fn map(path: &str) -> &'static [u8] {
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 
-/// Index of the first `b` at or after `i`: 32 bytes per step with AVX2, then bytewise.
-#[inline(always)]
-fn find(buf: &[u8], mut i: usize, b: u8) -> usize {
-    #[cfg(target_feature = "avx2")]
-    while i + 32 <= buf.len() {
-        use std::arch::x86_64::*;
-        // SAFETY: AVX2 is enabled at compile time and the 32 bytes are inside `buf`.
-        let m = unsafe {
-            let v = _mm256_loadu_si256(buf.as_ptr().add(i).cast());
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b as i8))) as u32
-        };
-        if m != 0 {
-            return i + m.trailing_zeros() as usize;
-        }
-        i += 32;
-    }
-    i + buf[i..]
-        .iter()
-        .position(|&c| c == b)
-        .unwrap_or(buf.len() - i)
-}
-
-/// Reads an unsigned decimal at `*i`, stopping at the first non-digit.
-#[inline(always)]
-fn digits(buf: &[u8], i: &mut usize) -> u64 {
-    let mut v = 0;
-    while *i < buf.len() && buf[*i].is_ascii_digit() {
-        v = v * 10 + u64::from(buf[*i] - b'0');
-        *i += 1;
-    }
-    v
-}
-
 /// Bit masks of `"`, `,` and LF in the 64 bytes at `buf[i..]` (bit k is byte i + k).
 /// Bytes past the end of `buf` count as none of them.
 #[inline(always)]
@@ -223,19 +190,19 @@ fn hash(s: &[u8]) -> u64 {
         .wrapping_mul(K)
 }
 
-/// Which countries each distinct name occurs in, shared by all threads.
+/// The distinct names, shared by all threads, each with a dense id.
 ///
-/// A name is stored once in `words` as [4 words: country mask][len][name, zero-padded],
-/// and found through an open-addressing table whose slots hold the top 32 bits of the
-/// name's hash and the record's word offset. All threads share it, so it is one copy of
-/// about 100,000 names that stays in L3, and the lookup that confirms a name also brings
-/// its country mask into cache. New names are added without locks: the record is written
-/// at a bump-allocated offset, then published with a compare-and-swap on the empty slot.
-/// A thread that loses that race leaves an unpublished record with an empty mask.
-struct NameSets<'a> {
+/// A name is stored once in `words` as [id][len][name, zero-padded] and found through an
+/// open-addressing table whose slots hold the top 32 bits of the name's hash and the
+/// record's word offset. It is one copy of about 100,000 names, small enough for L3, and
+/// after warm-up nothing writes to it, so its cache lines stay shared by all cores. New
+/// names are added without locks: the record is written at a bump-allocated offset, then
+/// published with a compare-and-swap on the empty slot (a loser's record stays unused).
+struct Names<'a> {
     slots: &'a [AtomicU64],
     words: &'a [AtomicU64],
     used: AtomicUsize,
+    ids: AtomicUsize,
 }
 
 /// Views zeroed u64 storage as atomics. Zeroed allocations are lazily committed, so a
@@ -246,8 +213,9 @@ fn atomics(v: &mut [u64]) -> &[AtomicU64] {
     unsafe { &*(v as *mut [u64] as *const [AtomicU64]) }
 }
 
-impl NameSets<'_> {
-    fn add(&self, name: &[u8], g: usize) {
+impl Names<'_> {
+    /// The id of `name`, adding it if it is new.
+    fn id(&self, name: &[u8]) -> u32 {
         let h = hash(name);
         let n = name.len().div_ceil(8);
         let (mask, tag) = (self.slots.len() - 1, h & !0xFFFF_FFFF);
@@ -255,52 +223,28 @@ impl NameSets<'_> {
         loop {
             let mut e = self.slots[s].load(Acquire);
             if e == 0 {
-                let w = self.used.fetch_add(5 + n, Relaxed);
-                assert!(w + 5 + n <= self.words.len(), "name storage full");
-                self.words[w + 4].store(name.len() as u64, Relaxed);
+                let w = self.used.fetch_add(2 + n, Relaxed);
+                assert!(w + 2 + n <= self.words.len(), "name storage full");
+                self.words[w].store(self.ids.fetch_add(1, Relaxed) as u64, Relaxed);
+                self.words[w + 1].store(name.len() as u64, Relaxed);
                 for i in 0..n {
-                    self.words[w + 5 + i].store(word(name, i), Relaxed);
+                    self.words[w + 2 + i].store(word(name, i), Relaxed);
                 }
                 match self.slots[s].compare_exchange(0, tag | (w as u64 + 1), Release, Acquire) {
-                    Ok(_) => return self.mark(w, g),
+                    Ok(_) => return self.words[w].load(Relaxed) as u32,
                     Err(winner) => e = winner, // another thread filled this slot first
                 }
             }
             let w = (e & 0xFFFF_FFFF) as usize - 1;
             if e & !0xFFFF_FFFF == tag
-                && self.words[w + 4].load(Relaxed) == name.len() as u64
-                && (0..n).all(|i| self.words[w + 5 + i].load(Relaxed) == word(name, i))
+                && self.words[w + 1].load(Relaxed) == name.len() as u64
+                && (0..n).all(|i| self.words[w + 2 + i].load(Relaxed) == word(name, i))
             {
-                return self.mark(w, g);
+                return self.words[w].load(Relaxed) as u32;
             }
             s = (s + 1) & mask;
             assert!(s != h as usize & mask, "name table full");
         }
-    }
-
-    #[inline(always)]
-    fn mark(&self, w: usize, g: usize) {
-        let (cell, bit) = (&self.words[w + g / 64], 1u64 << (g % 64));
-        if cell.load(Relaxed) & bit == 0 {
-            cell.fetch_or(bit, Relaxed);
-        }
-    }
-
-    /// Distinct names per country: walk every stored record and count its mask bits.
-    fn distinct(&self, groups: usize) -> Vec<u64> {
-        let mut out = vec![0; groups];
-        let mut w = 0;
-        while w < self.used.load(Relaxed) {
-            for k in 0..4 {
-                let mut x = self.words[w + k].load(Relaxed);
-                while x != 0 {
-                    out[k * 64 + x.trailing_zeros() as usize] += 1;
-                    x &= x - 1;
-                }
-            }
-            w += 5 + (self.words[w + 4].load(Relaxed) as usize).div_ceil(8);
-        }
-        out
     }
 }
 
@@ -339,9 +283,10 @@ impl Agg {
 }
 
 /// Parses whole records (`buf` starts at a record and ends after a terminator or at EOF)
-/// into per-country aggregates, recording each name's country in `names`.
-fn parse(buf: &[u8], country_of: &[u8], names: &NameSets, groups: usize) -> Vec<Agg> {
+/// into per-country aggregates and per-country lists of name ids.
+fn parse(buf: &[u8], country_of: &[u8], names: &Names, groups: usize) -> (Vec<Agg>, Vec<Vec<u32>>) {
     let mut aggs = vec![Agg::EMPTY; groups];
+    let mut name_ids = vec![Vec::new(); groups];
     let mut seps = Separators::new(buf);
     let mut start = 0;
     while start < buf.len() {
@@ -376,9 +321,9 @@ fn parse(buf: &[u8], country_of: &[u8], names: &NameSets, groups: usize) -> Vec<
         a.max = a.max.max(amount);
         a.name_bytes += name_len;
         a.note_bytes += note_len;
-        names.add(name, g);
+        name_ids[g].push(names.id(name));
     }
-    aggs
+    (aggs, name_ids)
 }
 
 /// Splits the records into `n` pieces, each starting at a record. Per spec section 2.2 a
@@ -421,17 +366,21 @@ fn main() {
     let mut rows: Vec<(usize, u16)> = Vec::new();
     let mut slot_of = vec![u16::MAX; 26 * 26 * 26];
     let mut codes: Vec<&[u8]> = Vec::new();
-    let mut p = find(regions, 0, b'\n') + 1;
-    while p + 4 < regions.len() {
-        let id = digits(regions, &mut p) as usize;
-        let code = &regions[p + 1..p + 4];
+    for line in regions
+        .split(|&c| c == b'\n')
+        .skip(1)
+        .filter(|l| l.len() > 4)
+    {
+        let (id, code) = (
+            number(&line[..line.len() - 4]) as usize,
+            &line[line.len() - 3..],
+        );
         let key = code.iter().fold(0, |k, &c| k * 26 + usize::from(c - b'A'));
         if slot_of[key] == u16::MAX {
             slot_of[key] = codes.len() as u16;
             codes.push(code);
         }
         rows.push((id, slot_of[key]));
-        p += 5;
     }
     let mut order: Vec<usize> = (0..codes.len()).collect();
     order.sort_unstable_by_key(|&i| codes[i]);
@@ -450,18 +399,23 @@ fn main() {
 
     // records.csv: skip an optional BOM and the header line, then parse in parallel.
     let records = map(&format!("{data_dir}/records.csv"));
-    let body = &records[find(records, 0, b'\n').min(records.len().saturating_sub(1)) + 1..];
+    let header_end = records
+        .iter()
+        .position(|&c| c == b'\n')
+        .map_or(records.len(), |i| i + 1);
+    let body = &records[header_end..];
     // Shared name storage: 2^19 slots (about 100,000 names fill under a fifth of them) and
     // room for every record to bring a new name, of which only the used pages are touched.
     let mut slot_mem = vec![0u64; 1 << 19];
     let mut word_mem = vec![0u64; body.len() / 2 + 1024];
-    let names = NameSets {
+    let names = Names {
         slots: atomics(&mut slot_mem),
         words: atomics(&mut word_mem),
         used: AtomicUsize::new(0),
+        ids: AtomicUsize::new(0),
     };
     let (country_of, names) = (&country_of, &names);
-    let parts: Vec<Vec<Agg>> = thread::scope(|sc| {
+    let parts: Vec<(Vec<Agg>, Vec<Vec<u32>>)> = thread::scope(|sc| {
         let handles: Vec<_> = split_records(body, threads)
             .into_iter()
             .map(|chunk| sc.spawn(move || parse(chunk, country_of, names, groups)))
@@ -469,11 +423,46 @@ fn main() {
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    let distinct = names.distinct(groups);
+    // Distinct names per country, one country at a time per worker. `last[id]` is the last
+    // country that counted name `id`, so it never needs clearing between countries.
+    let next = AtomicUsize::new(0);
+    let n_ids = names.ids.load(Relaxed);
+    let mut distinct = vec![0u32; groups];
+    let found: Vec<Vec<(usize, u32)>> = thread::scope(|sc| {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let (parts, next) = (&parts, &next);
+                sc.spawn(move || {
+                    let mut last = vec![u16::MAX; n_ids];
+                    let mut out = Vec::new();
+                    loop {
+                        let g = next.fetch_add(1, Relaxed);
+                        if g >= groups {
+                            break;
+                        }
+                        let mut n = 0;
+                        for id in parts.iter().flat_map(|p| &p.1[g]) {
+                            if last[*id as usize] != g as u16 {
+                                last[*id as usize] = g as u16;
+                                n += 1;
+                            }
+                        }
+                        out.push((g, n));
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    found
+        .into_iter()
+        .flatten()
+        .for_each(|(g, n)| distinct[g] = n);
     let mut text = String::new();
     for g in 0..groups {
         let mut a = Agg::EMPTY;
-        parts.iter().for_each(|p| a.merge(&p[g]));
+        parts.iter().for_each(|p| a.merge(&p.0[g]));
         if a.count == 0 {
             continue;
         }

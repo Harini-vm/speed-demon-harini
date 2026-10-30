@@ -51,6 +51,48 @@ fn number(buf: &[u8], i: &mut usize) -> u64 {
     v
 }
 
+const ONES: u64 = 0x0101_0101_0101_0101;
+
+#[inline(always)]
+fn word(buf: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(buf[i..i + 8].try_into().unwrap())
+}
+
+/// SWAR: the index of the first byte of `w` below `n` (a space or LF for n = b'0'), or 8.
+/// The borrow can flag a false byte only above a real one, so the lowest flag is exact.
+#[inline(always)]
+fn first_below(w: u64, n: u8) -> usize {
+    ((w.wrapping_sub(ONES * u64::from(n)) & !w & (ONES << 7)).trailing_zeros() / 8) as usize
+}
+
+/// `number` without a loop per digit: the separator is found a word at a time, and the
+/// last (up to) eight digits are converted at once, as one word ending at the separator
+/// with the bytes before the number masked to zero digits (pairs, quads, then octets).
+#[inline(always)]
+fn number_fast(buf: &[u8], i: &mut usize) -> u64 {
+    let q = *i;
+    if q < 8 || q + 16 > buf.len() {
+        return number(buf, i); // too close to either end for the word loads
+    }
+    let k = first_below(word(buf, q), b'0');
+    let end = if k < 8 {
+        q + k
+    } else {
+        q + 8 + first_below(word(buf, q + 8), b'0')
+    };
+    let keep = (end - q).min(8);
+    let mask = u64::MAX << (8 * (8 - keep));
+    let d = (word(buf, end - 8) & mask) - (ONES * u64::from(b'0') & mask);
+    let v = (d * 10 + (d >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let v = (v * 100 + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+    let low = (v * 10_000 + (v >> 32)) & 0xFFFF_FFFF;
+    let high = buf[q..end - keep]
+        .iter()
+        .fold(0, |a, &c| a * 10 + u64::from(c - b'0'));
+    *i = end + 1;
+    high * 100_000_000 + low
+}
+
 /// Splits `buf` into `n` pieces that each end just after a newline.
 fn split_lines(buf: &[u8], n: usize) -> Vec<&[u8]> {
     let mut out = Vec::with_capacity(n);
@@ -98,9 +140,9 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
                     let mut buckets = vec![Vec::with_capacity(expect + expect / 4 + 16); nb];
                     let mut j = 0;
                     while j < chunk.len() {
-                        let u = number(chunk, &mut j) as u32;
-                        let v = number(chunk, &mut j) as u32;
-                        let w = number(chunk, &mut j) as u32;
+                        let u = number_fast(chunk, &mut j) as u32;
+                        let v = number_fast(chunk, &mut j) as u32;
+                        let w = number_fast(chunk, &mut j) as u32;
                         if u != v {
                             buckets[(u >> SHIFT) as usize].push([u, v, w]);
                         }
@@ -201,13 +243,30 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
     drop(claimed);
     let order: Vec<u32> = orders.concat();
     drop(orders);
+    // new_id[old] and each node's degree, in parallel: both are random reads or writes
+    // over 1.74 million nodes, too slow as one thread's loop.
     let mut new_id = vec![0u32; n];
-    for (k, &u) in order.iter().enumerate() {
-        new_id[u as usize] = k as u32;
-    }
     let mut off = vec![0u32; n + 1];
-    for (k, &u) in order.iter().enumerate() {
-        off[k + 1] = off[k] + g.off[u as usize + 1] - g.off[u as usize];
+    let (idp, degp) = (SharedPtr(new_id.as_mut_ptr()), SharedPtr(off.as_mut_ptr()));
+    thread::scope(|sc| {
+        for t in 0..threads {
+            let (order, g) = (&order, &g);
+            sc.spawn(move || {
+                let (idp, degp) = (idp, degp);
+                for k in n * t / threads..n * (t + 1) / threads {
+                    let u = order[k] as usize;
+                    // SAFETY: k (and so u, since order is a permutation) belongs to this
+                    // thread alone.
+                    unsafe {
+                        *idp.0.add(u) = k as u32;
+                        *degp.0.add(k + 1) = g.off[u + 1] - g.off[u];
+                    }
+                }
+            });
+        }
+    });
+    for k in 0..n {
+        off[k + 1] += off[k];
     }
     // Copy each node's edge list to its new place, in parallel over ranges of new ids.
     let mut adj = vec![(0u32, 0u32); g.adj.len()];
@@ -235,11 +294,12 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
 
 /// A radix heap: a priority queue for keys that never go below the last key popped, as in
 /// Dijkstra. An entry sits in bucket `bits(key ^ last)`. Popping refills bucket 0 from the
-/// lowest non-empty bucket, and each entry moves down at most 64 times in total.
+/// lowest non-empty bucket, and each entry moves down at most 32 times in total. Keys are
+/// u32: a search whose distances would leave u32 goes to `shortest_wide` instead.
 struct RadixHeap {
-    last: u64,
+    last: u32,
     len: usize,
-    buckets: Vec<Vec<(u64, u32)>>,
+    buckets: Vec<Vec<(u32, u32)>>,
 }
 
 impl RadixHeap {
@@ -247,24 +307,24 @@ impl RadixHeap {
         RadixHeap {
             last: 0,
             len: 0,
-            buckets: vec![Vec::new(); 65],
+            buckets: vec![Vec::new(); 33],
         }
     }
 
     #[inline(always)]
-    fn push(&mut self, key: u64, v: u32) {
+    fn push(&mut self, key: u32, v: u32) {
         self.len += 1;
-        self.buckets[64 - (key ^ self.last).leading_zeros() as usize].push((key, v));
+        self.buckets[32 - (key ^ self.last).leading_zeros() as usize].push((key, v));
     }
 
     /// The smallest key, or None when empty. Bucket 0 holds only keys equal to `last`.
-    fn min(&mut self) -> Option<u64> {
+    fn min(&mut self) -> Option<u32> {
         if self.buckets[0].is_empty() {
-            let i = (1..65).find(|&i| !self.buckets[i].is_empty())?;
+            let i = (1..33).find(|&i| !self.buckets[i].is_empty())?;
             let mut items = std::mem::take(&mut self.buckets[i]);
             self.last = items.iter().map(|e| e.0).min().unwrap();
             for &(key, v) in &items {
-                self.buckets[64 - (key ^ self.last).leading_zeros() as usize].push((key, v));
+                self.buckets[32 - (key ^ self.last).leading_zeros() as usize].push((key, v));
             }
             items.clear();
             self.buckets[i] = items; // keep the capacity
@@ -272,7 +332,7 @@ impl RadixHeap {
         Some(self.last)
     }
 
-    fn pop(&mut self) -> Option<(u64, u32)> {
+    fn pop(&mut self) -> Option<(u32, u32)> {
         self.min()?;
         self.len -= 1;
         self.buckets[0].pop()
@@ -362,6 +422,7 @@ impl Side {
     /// node the other side has labelled is a complete s-t path; `best` keeps the shortest.
     fn step(&mut self, g: &Graph, other: &[u32], best: &mut u64, wide: &mut bool) {
         let (d, u) = self.heap.pop().unwrap();
+        let d = u64::from(d);
         if d + 1 > u64::from(self.dist[u as usize]) {
             return; // stale entry
         }
@@ -381,7 +442,7 @@ impl Side {
                     self.touched.push(v);
                 }
                 *dv = nd as u32 + 1;
-                self.heap.push(nd, v);
+                self.heap.push(nd as u32, v);
             }
         }
     }
@@ -404,7 +465,7 @@ fn shortest(
     f.start(s);
     b.start(t);
     while let (Some(kf), Some(kb)) = (f.heap.min(), b.heap.min()) {
-        if wide || kf + kb >= best {
+        if wide || u64::from(kf) + u64::from(kb) >= best {
             break;
         }
         if f.heap.len <= b.heap.len {
