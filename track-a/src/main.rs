@@ -319,7 +319,6 @@ fn main() {
     // 1. Parse in parallel.
     let mut parts = par_map(split_lines(buf, threads), |chunk| parse(chunk, base_hour));
 
-    if parts.len() < 1000 { std::process::exit(3) } // PROFILE: stop after the parse
     // 2. Global endpoint ranks, in byte order (slice Ord puts a proper prefix first). Each
     //    thread's names arrive sorted, and a stable sort merges sorted runs in linear passes.
     //    Each thread then maps ranks to its local ids (NONE where it never saw the name).
@@ -432,6 +431,7 @@ fn main() {
         }
     });
     drop(parts);
+    if n_groups > 0 { std::process::exit(3) } // PROFILE: stop after the scatter
 
     // 5. Percentiles and formatting, groups split into ranges of about equal latency count.
     let hour_text: Vec<String> = (0..n_hours as i64)

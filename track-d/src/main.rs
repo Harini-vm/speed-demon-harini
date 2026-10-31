@@ -627,7 +627,6 @@ fn main() {
         build_graph(map(&format!("{data_dir}/graph.txt")), threads),
         threads,
     );
-    if threads < 1000 { std::process::exit(3) } // PROFILE: stop after build + renumbering
     let qtext = map(&format!("{data_dir}/queries.txt"));
     let mut queries = Vec::new();
     let mut i = 0;
@@ -638,6 +637,7 @@ fn main() {
     drop(new_id);
     let rev = reverse(&g, threads);
 
+    if threads > 0 { std::process::exit(3) } // PROFILE: stop after the reverse graph
     // Queries sorted by source and handed out four at a time: the threads then all work in
     // one moving part of the renumbered map, which the shared cache holds, and short runs
     // keep a few long searches from leaving one thread last. Answers: i64, -1 unreachable.

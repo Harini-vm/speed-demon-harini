@@ -529,7 +529,6 @@ fn main() {
     for round in split_records(body, threads * ROUNDS).chunks(threads) {
         let jobs: Vec<_> = round.iter().zip(states).collect();
         states = par_map(jobs, |(chunk, st)| parse(chunk, country_of, names, st));
-        if states.len() < 1000 { std::process::exit(3) } // PROFILE: stop after round 1 parse
         let (rows, words) = (
             Mutex::new(seen.iter_mut().enumerate()),
             names.ids.load(Relaxed) / 64 + 1,
@@ -544,6 +543,7 @@ fn main() {
             }
         });
     }
+    if threads > 0 { std::process::exit(3) } // PROFILE: stop after all rounds
     let distinct: Vec<u32> = seen
         .iter()
         .map(|row| row.iter().map(|w| w.count_ones()).sum())
