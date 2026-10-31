@@ -311,7 +311,7 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
 /// region is a breadth-first ball of at most REGION nodes, about an 8 x 8 patch of the
 /// map, and the next region starts where the last one stopped, so a search's ball covers
 /// whole patches instead of thin slices of long breadth-first rings.
-const REGION: usize = 128;
+const REGION: usize = 64;
 
 /// Starts loading the cache line at `p` (a hint: any address is safe).
 #[inline(always)]
