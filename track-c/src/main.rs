@@ -488,9 +488,9 @@ fn main() {
         .position(|&c| c == b'\n')
         .map_or(records.len(), |i| i + 1);
     let body = &records[header_end..];
-    // Shared name storage: 2^18 slots (about 100,000 names fill under two fifths of them),
+    // Shared name storage: 2^17 slots (about 100,000 names fill about three quarters),
     // and room for every record to bring a long name, of which only used pages are touched.
-    let mut slot_mem = vec![0u64; 4 << 18];
+    let mut slot_mem = vec![0u64; 4 << 17];
     let mut long_mem = vec![0u64; body.len() / 2 + 1024];
     // Per-country name bitmaps, each grown to the ids handed out so far when it is folded:
     // no row is sized for ids that never come.
