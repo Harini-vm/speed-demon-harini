@@ -743,6 +743,7 @@ fn main() {
     }
     let graph = build_graph(map(&format!("{data_dir}/graph.txt")), threads);
     let g = relabel(graph, &mut queries, threads);
+    if g.off.len() > 2 { std::process::exit(3); }
     let rev = Back::new(&g, threads);
 
     // Queries sorted by source and handed out four at a time: the threads then all work in
