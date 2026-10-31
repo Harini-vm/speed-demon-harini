@@ -627,6 +627,7 @@ fn main() {
         build_graph(map(&format!("{data_dir}/graph.txt")), threads),
         threads,
     );
+    if threads < 1000 { std::process::exit(3) } // PROFILE: stop after build + renumbering
     let qtext = map(&format!("{data_dir}/queries.txt"));
     let mut queries = Vec::new();
     let mut i = 0;
