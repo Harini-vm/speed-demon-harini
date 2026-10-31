@@ -204,3 +204,5 @@ Box: 156.6 ms and 79.6 MiB, against 82.6 MiB for step 17.
 Box phase times for this step (each build exits with one phase's milliseconds as its exit code): parse 15 ms (done 21 ms after start), CSR 12 ms (memory there 69.6 MiB, against 52 MB in a local cgroup: the box's huge pages), BFS with the list buffers 20 ms (77.7 MiB), new ids and the copy 15 ms, reverse weights 17 ms, queries about 65 ms.
 
 Also measured on the box, not kept: the queries on 6 threads instead of 12 (178.5 and 177.9 ms against 162.3 and 183.0), and a second prefetch for the node after next (152.6 and 184.7 ms: no difference within the noise).
+
+Box, renumbering patch size (REGION): 32 nodes 152.4 ms, 64 nodes 152.5 ms, 128 nodes 152.0 ms. No difference; it stays 64.
