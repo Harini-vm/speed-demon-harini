@@ -8,7 +8,8 @@ Every step from the reference to the final version, each with the live-board run
 | 1 | Rust: structural (AVX2 bitmask) CSV parsing, array join, shared lock-free name sets | `e8571e5` | 0.092 | 41 | 416 | 15.88 | 60.036 |
 | 2 | Country marks moved out of the shared table into private per-thread lists; regions read with plain iterators | `5e6ffc1` | 0.082 | 41 | 411 | 16.83 | 61.302 |
 | 3 | Smaller source: the same logic in fewer lines | _fill in_ | | | | | |
-| 4 | Name ids folded into per-country bitmaps after each of four parse rounds; one-line name slots | _fill in_ | | | | | |
+| 4 | Name ids folded into per-country bitmaps after each of four parse rounds; one-line name slots | `9157dea` | 0.064 | 47 | 416 | 18.57 | 63.442 |
+| 5 | regions.csv parsed in parallel in one pass; name slots prefetched four records ahead | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -71,3 +72,15 @@ Elimination test (2 threads, min of 7): the run took 323 ms, 161 ms with the loo
 Local, 2 threads: 328 ms to 216 ms (min of 9, alternating runs); with 12 forced threads, 306 ms to 224 ms. Peak anonymous memory at 12 threads: 19 MB.
 
 407 code lines (from 385). Correctness: identical SHA-256 to the reference on tiny seeds 1 to 25, sample seeds 1 to 6, full seeds 1 and 13, the worked example, a file without a final terminator, a header-only file, a hand-made file with names longer than 24 bytes, exactly 23 and 24 bytes and with escaped quotes, and with 1, 3 and 13 threads.
+
+Board, step 4: T 78 to 64 ms. M went from 41 to 47 MB on the board, while this machine's 12-thread peak fell from 29 to 19 MB. A local memory cgroup (the same measure as the box's `memory.peak`) gives 30 and 20 MB, and I could not reproduce the difference here: transparent huge pages set to `always`, and more thread starts, both left it unchanged. The other tracks measure within 3 to 7 MB of the board this way.
+
+## Step 5
+
+- **regions.csv in parallel.** The table was built in four serial passes over the 2 MB file (codes, ranks, the last id, then the fill), about 6 ms on one thread. That is about a tenth of a 64 ms run, and none of it scaled. Now the threads parse their part of the lines into (region id, code key) pairs in one pass. Main then sets the ranks and fills the table from those pairs with plain loops.
+- **Prefetching name slots.** Lookups were about 80 of 214 ms (2 threads) beyond hashing, mostly waiting for a random slot in the 8 MB table. Each record's slot is now prefetched as soon as its name is hashed, and the lookup itself runs four records later. Prefetching one record ahead gave about 5%, four records ahead a little more (2, 4 and 8 were within noise of each other).
+- **A crash fixed.** `split_records` read `buf[c - 1]` with `c = 0` when the text was shorter than the number of pieces. Since step 4 the records are split into 4 × threads pieces, so a records file of one short record crashed. The cut now starts at 1 at least. Tested with that file and with 1, 3, 13 and 52 threads.
+
+Local, 2 threads: about 205 to 200 ms (min of 9, alternating). Most of the gain is the serial regions step, which this machine's two threads hide and the box's twelve do not.
+
+435 code lines. Correctness: identical SHA-256 to the reference on tiny seeds 1 to 25, sample seeds 1 to 6, full seeds 1 and 13, the worked example, a file without a final terminator, a header-only file, a one-record file, the long-name file, with 1, 3, 13 and 52 threads, and with a build without AVX2.

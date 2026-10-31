@@ -222,8 +222,20 @@ fn atomics(v: &mut [u64]) -> &[AtomicU64] {
 
 impl Names<'_> {
     /// The id of `name`, adding it if it is new.
-    fn id(&self, name: &[u8]) -> u32 {
-        let h = hash(name);
+    /// Starts loading the slot where a name with hash `h` is looked up first.
+    #[inline(always)]
+    fn prefetch(&self, h: u64) {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a prefetch is only a hint, and the address is inside `slots`.
+        unsafe {
+            use std::arch::x86_64::*;
+            let s = h as usize & (self.slots.len() / 4 - 1);
+            _mm_prefetch(self.slots.as_ptr().add(s * 4).cast(), _MM_HINT_T0);
+        }
+    }
+
+    /// The id of `name`, whose hash is `h`, adding the name if it is new.
+    fn id(&self, name: &[u8], h: u64) -> u32 {
         let n = name.len().div_ceil(8);
         let key = (h & !0xFF_FFFF_FFFF) | (name.len().min(255) as u64) << 32;
         let mask = self.slots.len() / 4 - 1;
@@ -320,6 +332,8 @@ fn parse(buf: &[u8], country_of: &[u8], names: &Names, (mut aggs, mut name_ids):
     name_ids.iter_mut().for_each(Vec::clear); // the last round's ids are in the bitmaps
     let groups = aggs.len();
     let mut seps = Separators::new(buf);
+    let mut pending: [Option<(&[u8], u64, usize)>; AHEAD] = [None; AHEAD];
+    let mut count = 0;
     let mut start = 0;
     while start < buf.len() {
         let (e0, q0) = seps.next();
@@ -353,10 +367,23 @@ fn parse(buf: &[u8], country_of: &[u8], names: &Names, (mut aggs, mut name_ids):
         a.max = a.max.max(amount);
         a.name_bytes += name_len;
         a.note_bytes += note_len;
-        name_ids[g].push(names.id(name));
+        // The lookup runs AHEAD records late: this record's slot is prefetched now, and by
+        // the time its lookup runs the slot is already in the cache.
+        let h = hash(name);
+        names.prefetch(h);
+        if let Some((name, h, g)) = pending[count % AHEAD].replace((name, h, g)) {
+            name_ids[g].push(names.id(name, h));
+        }
+        count += 1;
+    }
+    for (name, h, g) in pending.into_iter().flatten() {
+        name_ids[g].push(names.id(name, h));
     }
     (aggs, name_ids)
 }
+
+/// How many records a name lookup trails its slot's prefetch.
+const AHEAD: usize = 4;
 
 /// Splits the records into `n` pieces, each starting at a record. Per spec section 2.2 a
 /// note's lines are lowercase words and names never hold an LF, so an LF followed by a
@@ -364,7 +391,11 @@ fn parse(buf: &[u8], country_of: &[u8], names: &Names, (mut aggs, mut name_ids):
 fn split_records(buf: &[u8], n: usize) -> Vec<&[u8]> {
     let mut cuts = vec![0];
     for i in 1..n {
-        let mut c = (buf.len() * i / n).max(*cuts.last().unwrap());
+        // At least 1, so buf[c - 1] exists when buf is shorter than n bytes.
+        let mut c = (buf.len() * i / n)
+            .max(*cuts.last().unwrap())
+            .max(1)
+            .min(buf.len());
         while c < buf.len()
             && !(buf[c - 1] == b'\n' && (buf[c].is_ascii_digit() || buf[c] == BOM[0]))
         {
@@ -408,19 +439,26 @@ fn main() {
     // A code's base-26 key sorts like the code itself, so walking the 26^3 table in key
     // order hands out ranks in output order with no sort.
     let regions = map(&format!("{data_dir}/regions.csv"));
-    let lines = || {
-        regions
+    let body = &regions[regions
+        .iter()
+        .position(|&c| c == b'\n')
+        .map_or(regions.len(), |i| i + 1)..];
+    // Parse the lines in parallel into (region id, code key) pairs.
+    let pairs: Vec<(usize, usize)> = par_map(split_records(body, threads), |chunk| {
+        chunk
             .split(|&c| c == b'\n')
-            .skip(1)
             .filter(|l| l.len() > 4)
-    };
-    let key = |l: &[u8]| {
-        l[l.len() - 3..]
-            .iter()
-            .fold(0, |k, &c| k * 26 + usize::from(c - b'A'))
-    };
+            .map(|l| {
+                let key = l[l.len() - 3..]
+                    .iter()
+                    .fold(0, |k, &c| k * 26 + usize::from(c - b'A'));
+                (number(&l[..l.len() - 4]) as usize, key)
+            })
+            .collect::<Vec<_>>()
+    })
+    .concat();
     let mut rank = vec![u8::MAX; 26 * 26 * 26];
-    lines().for_each(|l| rank[key(l)] = 0);
+    pairs.iter().for_each(|&(_, k)| rank[k] = 0);
     let mut codes: Vec<String> = Vec::new();
     for (k, r) in rank.iter_mut().enumerate().filter(|(_, r)| **r == 0) {
         assert!(codes.len() < 255, "more countries than a u8 rank holds");
@@ -433,9 +471,9 @@ fn main() {
         );
     }
     let groups = codes.len() + 1; // the last group is _UNMATCHED
-    let id = |l: &[u8]| number(&l[..l.len() - 4]) as usize;
-    let mut country_of = vec![(groups - 1) as u8; lines().last().map_or(0, |l| id(l) + 1)];
-    lines().for_each(|l| country_of[id(l)] = rank[key(l)]);
+    let mut country_of = vec![(groups - 1) as u8; pairs.last().map_or(0, |p| p.0 + 1)];
+    pairs.iter().for_each(|&(id, k)| country_of[id] = rank[k]);
+    drop(pairs);
 
     // records.csv: skip an optional BOM and the header line, then parse in parallel.
     let records = map(&format!("{data_dir}/records.csv"));
