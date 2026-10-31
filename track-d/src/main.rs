@@ -689,8 +689,10 @@ fn main() {
     // glibc keeps them in per-thread arenas and they count towards peak memory.
     // SAFETY: mallopt only tunes the allocator; it is called before any thread starts.
     unsafe { mallopt(-3, 128 * 1024) };
+    let g0 = build_graph(map(&format!("{data_dir}/graph.txt")), threads);
+    if g0.off.len() > 2 { std::process::exit(3); }
     let (g, new_id) = relabel(
-        build_graph(map(&format!("{data_dir}/graph.txt")), threads),
+        g0,
         threads,
     );
     let qtext = map(&format!("{data_dir}/queries.txt"));
