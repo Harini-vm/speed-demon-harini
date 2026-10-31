@@ -20,13 +20,18 @@ Identical SHA-256 to the Python reference on:
 - tiny seeds 1–25, sample seeds 1–6, and full seeds 1 and 13;
 - the spec's worked example, taken from `tests/test_c_join.py`;
 - a file whose last record has no terminator, and a file with only the header;
-- 1, 3, 12, 13 and 24 threads, since the chunk boundaries move with the thread count.
+- a one-record file, and names longer than 24 bytes or with escaped quotes;
+- 1, 3, 12, 13, 24 and 52 threads, since the chunk boundaries move with the thread count.
+
+## Memory
+
+Every allocation of 128 KiB or more gets its own mmap (`mallopt`), so freed blocks go back to the OS instead of staying in glibc's per-thread arenas. The name table has 2^17 slots, about three quarters full at full scale (4 MB).
 
 ## Dependencies
 
-None. `mmap` is declared directly against the C library the Rust standard library already links.
+None. `mmap` and `mallopt` are declared directly against the C library the Rust standard library already links.
 
 ## With another 24 hours
 
 - Profile-guided optimisation with the allowlisted `speed-demon-rust` image.
-- Separate the country masks from the name bytes, so threads writing masks do not invalidate the lines that other threads read to compare names.
+- Fewer passes per record: the parse still stops at every field separator one at a time.

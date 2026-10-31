@@ -329,40 +329,44 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
     drop(claimed);
     let order: Vec<u32> = orders.concat();
     drop(orders);
-    // new_id[old] and each node's degree, in parallel: both are random reads or writes
-    // over 1.74 million nodes, too slow as one thread's loop.
+    // new_id[old], in parallel: a random write per node, too slow as one thread's loop.
     let mut new_id = vec![0u32; n];
-    let mut off = vec![0u32; n + 1];
-    let (idp, degp) = (SharedPtr(new_id.as_mut_ptr()), SharedPtr(off.as_mut_ptr()));
+    let idp = SharedPtr(new_id.as_mut_ptr());
     par_map((0..threads).collect(), |t| {
         for k in n * t / threads..n * (t + 1) / threads {
-            let u = order[k] as usize; // order is a permutation, so u is this thread's alone
-            idp.set(u, k as u32);
-            degp.set(k + 1, g.off[u + 1] - g.off[u]);
+            idp.set(order[k] as usize, k as u32); // order is a permutation: one writer per slot
+        }
+    });
+    drop(order); // everything below works from new_id, so this memory is not held with both graphs
+                 // Each node's degree at its new id, then offsets, then each node's edge list copied to
+                 // its new place, all in parallel over ranges of old ids.
+    let ranges: Vec<_> = (0..threads)
+        .map(|t| n * t / threads..n * (t + 1) / threads)
+        .collect();
+    let mut off = vec![0u32; n + 1];
+    let degp = SharedPtr(off.as_mut_ptr());
+    par_map(ranges.clone(), |r| {
+        for u in r {
+            degp.set(new_id[u] as usize + 1, g.off[u + 1] - g.off[u]);
         }
     });
     for k in 0..n {
         off[k + 1] += off[k];
     }
-    // Copy each node's edge list to its new place, in parallel over ranges of new ids.
     let mut adj = zero_edges(g.adj.len());
-    let mut rest: &mut [Edge] = &mut adj;
-    let mut jobs = Vec::new();
-    for t in 0..threads {
-        let (k0, k1) = (n * t / threads, n * (t + 1) / threads);
-        let (mine, tail) = std::mem::take(&mut rest).split_at_mut((off[k1] - off[k0]) as usize);
-        rest = tail;
-        jobs.push((k0, k1, mine));
-    }
-    par_map(jobs, |(k0, k1, mine)| {
-        let mut slots = mine.iter_mut();
-        for &u in &order[k0..k1] {
-            for &Edge { v, w } in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize]
-            {
-                *slots.next().unwrap() = Edge {
-                    v: new_id[v as usize],
-                    w,
-                };
+    let dst = SharedPtr(adj.as_mut_ptr());
+    par_map(ranges, |r| {
+        for u in r {
+            let mut at = off[new_id[u] as usize] as usize; // u's list alone is written here
+            for &Edge { v, w } in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
+                dst.set(
+                    at,
+                    Edge {
+                        v: new_id[v as usize],
+                        w,
+                    },
+                );
+                at += 1;
             }
         }
     });

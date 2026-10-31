@@ -7,7 +7,7 @@ The task, the input files and the exact output format are in the [spec](https://
 Rust, standard library only, in `src/main.rs`. The work splits into building a cache-friendly graph and then answering 2,000 queries with bidirectional Dijkstra on all threads.
 
 1. **Parse into buckets.** `graph.txt` is memory-mapped and cut into one chunk per thread. Each thread parses its edge lines straight into buckets by tail node (65,536 node ids per bucket), dropping self-loops: they never shorten a path.
-2. **CSR without atomics.** Each bucket is turned into its slice of a compressed sparse row graph by one thread: count out-degrees (the counts fit in L2), prefix sum, place `(head, weight)` pairs. Buckets own disjoint ranges of the arrays, so no atomics are needed.
+2. **CSR without atomics.** Each bucket is turned into its slice of a compressed sparse row graph by one thread: count out-degrees (the counts fit in L2), prefix sum, place 6-byte edges: a `u32` head and a `u16` weight. All but about 50 of the 5 million weights fit; a larger one is stored as 65,535 and looked up in a short sorted side list. Buckets own disjoint ranges of the arrays, so no atomics are needed.
 3. **Renumber for locality.** The input ids are a random relabelling, so following an edge is almost always a cache miss. Each thread grows compact breadth-first patches of at most 64 nodes from roots in its own slice of the ids, claiming nodes with an atomic flag. Each patch starts where the last one stopped, and the graph is rebuilt in that order. Nodes that are close on the map are now close in memory.
 4. **Reverse graph** for the backward search: in-degrees, prefix sum, parallel scatter.
 5. **Queries.** `s == t` answers 0. A source with no out-edges or a target with no in-edges answers -1 without a search. Every other query runs a bidirectional Dijkstra:
@@ -27,5 +27,5 @@ None. `mmap` and `mallopt` are declared directly against the C library the Rust 
 ## With another 24 hours
 
 - A smaller source: the 64-bit fallback could reuse the main search with a generic distance type.
-- Store `(head, weight)` as one array per field, so the backward and forward graphs share fewer cache lines per relaxation.
+- One shared two-way adjacency: 97% of the edges have a reverse edge, so both search directions could read one list per node.
 - Profile-guided optimisation with the allowlisted `speed-demon-rust` image.

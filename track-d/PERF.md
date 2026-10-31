@@ -12,7 +12,8 @@ Every step from the reference to the final version, each with the live-board run
 | 5 | Patch-shaped renumbering; queries handed out four at a time; parse buckets freed one by one | `acaedaf` | 0.196 | 111 | 488 | 20.30 | 65.375 |
 | 6 | Experiment: transparent huge pages off for the process | `d430b7c` | 0.223 | 112 | 490 | 18.81 | 63.918 |
 | 7 | Reverted: huge pages back on (the code of step 5) | `81d8989` | 0.196 | 111 | 488 | 20.25 | 65.329 |
-| 8 | 6-byte edges: 16-bit weights, with the few larger ones in a side list | _fill in_ | | | | | |
+| 8 | 6-byte edges: 16-bit weights, with the few larger ones in a side list | `094ec9f` | 0.196 | 96 | 551 | 20.60 | 65.629 |
+| 9 | Renumbering copies by old id, so the node order is freed before both graphs exist | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -104,3 +105,9 @@ Each graph held its edges as (head u32, weight u32), 8 bytes. Every peak is set 
 Allocation matters for a type that is not a plain number: `vec![edge(0, 0); n]` writes every element in turn (about 10 ms per graph on one thread), so the edge arrays are now allocated zeroed and committed as the threads fill them.
 
 Local cgroup at 12 threads: 104 to 88 MB. Phase times within noise of before. Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9 (they include the 2^32 - 1 and over-2^32 answers), the worked example, with 1, 3 and 13 threads, and with a build without AVX2.
+
+Board, step 8: M 106 to 91.5 MiB at the same time. The source grew by 63 lines, so the score rose only 0.25.
+
+## Step 9
+
+During the renumbering's copy, the old graph, the new graph, `new_id` and the BFS `order` all existed together, and that is the run's peak. `order` is only needed to build `new_id`. The degrees and the copy now run over ranges of old ids, each node writing its list at its new offset, so `order` is freed first. Local cgroup at 12 threads: 88 to 85 MB, time within noise.
