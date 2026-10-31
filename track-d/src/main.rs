@@ -182,6 +182,19 @@ struct Graph {
     big: Vec<(u32, u32, u32)>,
 }
 
+impl Graph {
+    /// A stored weight of BIG from `u` to `v`: the smallest such edge's real weight
+    /// (parallel edges may share the pair; any of their weights is a real edge).
+    #[cold]
+    fn big_weight(&self, u: u32, v: u32) -> u64 {
+        let i = self.big.partition_point(|&(a, b, _)| (a, b) < (u, v));
+        let same = self.big[i..]
+            .iter()
+            .take_while(|&&(a, b, _)| (a, b) == (u, v));
+        u64::from(same.map(|e| e.2).min().unwrap())
+    }
+}
+
 /// A bucket holds the edges whose tail is in one run of 65,536 consecutive node ids: small
 /// enough for its counts to stay in L2, big enough for its vectors to be mmap-backed.
 const SHIFT: u32 = 16;
@@ -305,7 +318,7 @@ fn prefetch<T>(p: *const T) {
 }
 
 
-fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Net {
+fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
     let n = g.off.len() - 1;
     let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let claim = |x: usize| !claimed[x].load(Relaxed) && !claimed[x].swap(true, Relaxed);
@@ -356,50 +369,39 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Net {
     drop(claimed);
     let Graph { off, adj, big } = g;
     drop((off, adj)); // the old graph is no longer needed
-    // The threads' orders, one after another, are the new ids.
-    assert!(n < LINK as usize, "node ids must stay below the slot markers");
-    let mut new_id = vec![0u32; n];
-    let idp = SharedPtr(new_id.as_mut_ptr());
-    let mut k0 = 0;
-    let jobs: Vec<_> = parts.into_iter().map(|(order, list, ends)| {
-        k0 += order.len();
-        (k0 - order.len(), order, list, ends)
-    }).collect();
-    par_map(jobs.iter().collect(), |(k0, order, _, _)| {
-        order.iter().enumerate().for_each(|(k, &u)| idp.set(u as usize, (k0 + k) as u32)); // u is in one order
-    });
-    // Lists of up to four edges go to their node's four slots, longer ones to `more`, so a
-    // node's edges are found without an offset array and in one cache line.
-    let spill = |ends: &[u32]| (0..ends.len()).map(|k| ends[k] - k.checked_sub(1).map_or(0, |p| ends[p])).filter(|&d| d > 4).map(|d| d as usize + 1).sum::<usize>();
-    let counts = par_map(jobs.iter().collect(), |job| spill(&job.3));
-    let (mut slots, mut more) = (zeroed::<Edge8>(4 * n), zeroed::<Edge8>(counts.iter().sum()));
-    let (sp, mp) = (SharedPtr(slots.as_mut_ptr()), SharedPtr(more.as_mut_ptr()));
-    let id = |x: u32| new_id[x as usize];
-    let mut m0 = 0;
-    let jobs: Vec<_> = jobs.into_iter().zip(counts).map(|(job, c)| {
-        m0 += c;
-        (job, m0 - c)
-    }).collect();
-    par_map(jobs, |((k0, _, list, ends), mut m)| {
-        let mut prev = 0;
-        for (k, &end) in ends.iter().enumerate() {
-            let (x, part) = (k0 + k, &list[prev as usize..end as usize]);
-            let edge = |e: &Edge| Edge8 { v: id(e.v), w: e.w, rw: ABSENT };
-            prev = end;
-            if part.len() <= 4 {
-                (0..4).for_each(|i| sp.set(4 * x + i, part.get(i).map_or(Edge8 { v: NONE, w: 0, rw: 0 }, edge)));
-            } else {
-                sp.set(4 * x, Edge8 { v: LINK, w: m as u16, rw: (m >> 16) as u16 }); // x's alone
-                part.iter().enumerate().for_each(|(i, e)| mp.set(m + i, edge(e)));
-                mp.set(m + part.len(), Edge8 { v: NONE, w: 0, rw: 0 }); // this job's own room
-                m += part.len() + 1;
-            }
+    // The threads' orders, one after another, are the new ids; their list ends give `off`.
+    let (mut new_id, mut off) = (vec![0u32; n], vec![0u32; n + 1]);
+    let (idp, offp) = (SharedPtr(new_id.as_mut_ptr()), SharedPtr(off.as_mut_ptr()));
+    let (mut jobs, mut lists, mut base) = (Vec::new(), Vec::new(), (0, 0));
+    for (order, list, ends) in parts {
+        let next = (base.0 + order.len(), base.1 + list.len());
+        jobs.push((order, ends, base));
+        lists.push(list);
+        base = next;
+    }
+    par_map(jobs, |(order, ends, (k0, e0))| {
+        for (k, (&u, &end)) in order.iter().zip(&ends).enumerate() {
+            idp.set(u as usize, (k0 + k) as u32); // each node is in one order only
+            offp.set(k0 + k + 1, (e0 + end as usize) as u32);
         }
+    });
+    // Each thread's lists go to their place, their heads given new ids on the way.
+    let id = |x: u32| new_id[x as usize];
+    let mut adj = zeroed::<Edge>(lists.iter().map(Vec::len).sum());
+    let mut rest: &mut [Edge] = &mut adj;
+    let mut jobs = Vec::new();
+    for list in lists {
+        let (mine, tail) = std::mem::take(&mut rest).split_at_mut(list.len());
+        rest = tail;
+        jobs.push((mine, list));
+    }
+    par_map(jobs, |(mine, list)| {
+        mine.iter_mut().zip(&list).for_each(|(d, &e)| *d = Edge { v: id(e.v), w: e.w });
     });
     let mut big: Vec<_> = big.iter().map(|&(u, v, w)| (id(u), id(v), w)).collect();
     big.sort_unstable();
     queries.iter_mut().for_each(|q| *q = (id(q.0), id(q.1)));
-    Net { slots, more, big }
+    Graph { off, adj, big }
 }
 
 /// A radix heap: a priority queue for keys that never go below the last key popped, as in
@@ -486,41 +488,13 @@ struct Edge8 {
     rw: u16,
 }
 
-/// The query graph: node x's edges are `slots[4x..4x + 4]` up to the first NONE, or, if
-/// slot 4x is a LINK, `more[i..]` up to its NONE, with i in the LINK's two weight fields.
-struct Net {
-    slots: Vec<Edge8>,
-    more: Vec<Edge8>,
-    big: Vec<(u32, u32, u32)>, // as in Graph
-}
-
-const NONE: u32 = u32::MAX;
-const LINK: u32 = u32::MAX - 1;
-
-impl Net {
-    #[inline(always)]
-    fn list(&self, x: u32) -> impl Iterator<Item = &Edge8> + '_ {
-        let s = &self.slots[4 * x as usize..4 * x as usize + 4];
-        let s = if s[0].v != LINK { s } else { &self.more[usize::from(s[0].w) | usize::from(s[0].rw) << 16..] };
-        s.iter().take_while(|e| e.v != NONE)
-    }
-
-    /// A stored weight of BIG from `u` to `v`: the smallest such edge's real weight
-    /// (parallel edges may share the pair; any of their weights is a real edge).
-    #[cold]
-    fn big_weight(&self, u: u32, v: u32) -> u64 {
-        let i = self.big.partition_point(|&(a, b, _)| (a, b) < (u, v));
-        let same = self.big[i..].iter().take_while(|&&(a, b, _)| (a, b) == (u, v));
-        u64::from(same.map(|e| e.2).min().unwrap())
-    }
-}
-
 /// The query graph, without a second graph for the backward search. Road segments are
 /// nearly all two-way, so in-edge y -> x is usually the reverse of an out-edge x -> y, and
 /// its weight is kept in that edge's `rw` (the lightest one if parallel). The few others
 /// (one-way streets) are in `extra` as (head, tail, weight), flagged per head in `has_extra`.
 struct Back {
-    g: Net,
+    g: Graph, // `off` and `big`; its 6-byte edges are dropped once `adj` holds them
+    adj: Vec<Edge8>,
     extra: Vec<(u32, u32, u32)>,
     has_extra: Vec<u64>,
     start: Vec<u32>, // extra[start[b]..start[b + 1]] holds the heads in block b of 64 nodes
@@ -528,27 +502,22 @@ struct Back {
 
 impl Back {
     /// After the renumbering, y's list is near x's in memory, so finding x in it is cheap.
-    /// The reverse weights go to `rw`, indexed like `slots` then `more`, and from there into
-    /// the edges once every lookup is done.
-    fn new(mut g: Net, threads: usize) -> Self {
-        let n = g.slots.len() / 4;
-        let mut rw = vec![0u16; g.slots.len() + g.more.len()];
-        let dst = SharedPtr(rw.as_mut_ptr());
+    fn new(mut g: Graph, threads: usize) -> Self {
+        let n = g.off.len() - 1;
+        let mut adj = zeroed::<Edge8>(g.adj.len());
+        let dst = SharedPtr(adj.as_mut_ptr());
         let ranges: Vec<_> = (0..threads)
             .map(|t| n * t / threads..n * (t + 1) / threads)
             .collect();
         let found = par_map(ranges, |r| {
             let mut extra = Vec::new();
             for x in r {
-                let s = &g.slots[4 * x];
-                let at = if s.v != LINK { 4 * x } else { 4 * n + (usize::from(s.w) | usize::from(s.rw) << 16) };
-                if s.v == LINK {
-                    dst.set(4 * x, s.rw); // keep the LINK's index
-                }
-                for (i, &Edge8 { v: y, w, .. }) in g.list(x as u32).enumerate() {
+                for j in g.off[x] as usize..g.off[x + 1] as usize {
+                    let Edge { v: y, w } = g.adj[j];
+                    let back = &g.adj[g.off[y as usize] as usize..g.off[y as usize + 1] as usize];
                     let mut rev = ABSENT; // BIG < ABSENT, so the min is the lightest reverse
-                    g.list(y).for_each(|e| rev = if e.v == x as u32 { rev.min(e.w) } else { rev });
-                    dst.set(at + i, rev); // x's own entries
+                    back.iter().for_each(|e| rev = if e.v == x as u32 { rev.min(e.w) } else { rev });
+                    dst.set(j, Edge8 { v: y, w, rw: rev }); // edge j is in this thread's range
                     if rev == ABSENT {
                         let w = if w != BIG { u64::from(w) } else { g.big_weight(x as u32, y) };
                         extra.push((y, x as u32, w as u32));
@@ -557,10 +526,7 @@ impl Back {
             }
             extra
         });
-        let (a, b) = rw.split_at(g.slots.len());
-        g.slots.iter_mut().zip(a).for_each(|(e, &r)| e.rw = r);
-        g.more.iter_mut().zip(b).for_each(|(e, &r)| e.rw = r);
-        drop(rw);
+        g.adj = Vec::new();
         // Counting sort by block of 64 heads; a lookup scans its block's few entries.
         let (mut has_extra, mut start) = (vec![0u64; n / 64 + 1], vec![0u32; n / 64 + 2]);
         for &(y, _, _) in found.iter().flatten() {
@@ -574,7 +540,11 @@ impl Back {
             extra[cursor[e.0 as usize / 64] as usize] = e;
             cursor[e.0 as usize / 64] += 1;
         }
-        Back { g, extra, has_extra, start }
+        Back { g, adj, extra, has_extra, start }
+    }
+
+    fn list(&self, x: u32) -> &[Edge8] {
+        &self.adj[self.g.off[x as usize] as usize..self.g.off[x as usize + 1] as usize]
     }
 
     fn has_in(&self, x: u32) -> bool {
@@ -595,7 +565,7 @@ impl Adj for Fwd<'_> {
 
     #[inline(always)]
     fn each(&self, x: u32, mut f: impl FnMut(u32, u64)) {
-        for e in self.0.g.list(x) {
+        for e in self.0.list(x) {
             f(e.v, if e.w != BIG { u64::from(e.w) } else { self.0.g.big_weight(x, e.v) });
         }
     }
@@ -605,12 +575,12 @@ impl Adj for Fwd<'_> {
 impl Adj for Back {
     #[inline(always)]
     fn hint(&self, u: u32) {
-        prefetch(self.g.slots.as_ptr().wrapping_add(4 * u as usize));
+        prefetch(self.adj.as_ptr().wrapping_add(self.g.off[u as usize] as usize));
     }
 
     #[inline(always)]
     fn each(&self, x: u32, mut f: impl FnMut(u32, u64)) {
-        for e in self.g.list(x) {
+        for e in self.list(x) {
             if e.rw != ABSENT {
                 f(e.v, if e.rw != BIG { u64::from(e.rw) } else { self.g.big_weight(e.v, x) });
             }
@@ -804,8 +774,10 @@ fn main() {
     }
     let graph = build_graph(map(&format!("{data_dir}/graph.txt")), threads);
     let g = relabel(graph, &mut queries, threads);
+    let t0 = std::time::Instant::now();
     let rev = Back::new(g, threads);
-    let fwd = Fwd(&rev);
+    if rev.adj.len() > 1 { std::process::exit(t0.elapsed().as_millis().min(255) as i32); }
+    let (g, fwd) = (&rev.g, Fwd(&rev));
 
     // Queries sorted by source and handed out four at a time: the threads then all work in
     // one moving part of the renumbered map, which the shared cache holds, and short runs
@@ -814,7 +786,7 @@ fn main() {
     by_source.sort_unstable_by_key(|&q| queries[q].0);
     let runs: Vec<&[usize]> = by_source.chunks(4).collect();
     let answers: Vec<AtomicI64> = queries.iter().map(|_| AtomicI64::new(-1)).collect();
-    let (next, n) = (AtomicUsize::new(0), rev.g.slots.len() / 4);
+    let (next, n) = (AtomicUsize::new(0), g.off.len() - 1);
     par_map(vec![(); threads], |()| {
         let mut sides: Option<(Side, Side)> = None;
         while let Some(run) = runs.get(next.fetch_add(1, Relaxed)) {
@@ -822,7 +794,7 @@ fn main() {
                 let (s, t) = queries[q];
                 let answer = if s == t {
                     Some(0)
-                } else if rev.g.list(s).next().is_none() || !rev.has_in(t) {
+                } else if g.off[s as usize] == g.off[s as usize + 1] || !rev.has_in(t) {
                     None // no way out of s, or no way into t
                 } else {
                     let sides = sides.get_or_insert_with(|| (Side::new(n), Side::new(n)));
