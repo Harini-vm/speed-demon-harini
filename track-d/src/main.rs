@@ -702,7 +702,6 @@ fn main() {
     }
     drop(new_id);
     let rev = Back::new(&g, threads);
-    if rev.rw.len() > 1 { std::process::exit(3); }
 
     // Queries sorted by source and handed out four at a time: the threads then all work in
     // one moving part of the renumbered map, which the shared cache holds, and short runs
