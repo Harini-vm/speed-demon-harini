@@ -333,16 +333,20 @@ fn prefetch<T>(p: *const T) {
     };
 }
 
-/// How many nodes ahead the walks over `order` prefetch: the old ids are random, so each
-/// node's offsets and edge list are cache misses, and these overlap them.
-const AHEAD: usize = 16;
 
-fn relabel(mut g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
+fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
     let n = g.off.len() - 1;
     let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let claim = |x: usize| !claimed[x].load(Relaxed) && !claimed[x].swap(true, Relaxed);
-    let orders = par_map((0..threads).collect(), |t| {
+    // Each thread also appends every list it visits to its own `lists`: they are then the
+    // new graph's edges in order, and need only a sequential copy, not a random read each.
+    // SAFETY (prctl): only sets a flag of this process; the buffers fill sequentially,
+    // so huge pages would only commit the unused room at their ends.
+    unsafe { prctl(41, 1, 0, 0, 0) };
+    let parts = par_map((0..threads).collect(), |t| {
         let mut order: Vec<u32> = Vec::with_capacity(n / threads + n / threads / 4);
+        let mut lists: Vec<Edge> = Vec::with_capacity(g.adj.len() / threads + g.adj.len() / threads / 4);
+        let mut ends: Vec<u32> = Vec::with_capacity(order.capacity()); // where each list ends
         let mut seeds = std::collections::VecDeque::new();
         for root in n * t / threads..n * (t + 1) / threads {
             seeds.push_back(root as u32);
@@ -358,7 +362,10 @@ fn relabel(mut g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
                         prefetch(g.adj.as_ptr().wrapping_add(g.off[x as usize] as usize));
                     }
                     head += 1;
-                    for &Edge { v, .. } in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
+                    let list = &g.adj[g.off[u] as usize..g.off[u + 1] as usize];
+                    lists.extend_from_slice(list);
+                    ends.push(lists.len() as u32);
+                    for &Edge { v, .. } in list {
                         if order.len() - start < REGION {
                             if claim(v as usize) {
                                 prefetch(&g.off[v as usize]);
@@ -371,66 +378,46 @@ fn relabel(mut g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
                 }
             }
         }
-        order
+        (order, lists, ends)
     });
+    // SAFETY: as above.
+    unsafe { prctl(41, 0, 0, 0, 0) };
     drop(claimed);
-    let order: Vec<u32> = orders.concat();
-    drop(orders);
-    // new_id[old] and each node's degree, in parallel: both are random reads or writes
-    // over 1.74 million nodes, too slow as one thread's loop.
-    let mut new_id = vec![0u32; n];
-    let mut off = vec![0u32; n + 1];
-    let (idp, degp) = (SharedPtr(new_id.as_mut_ptr()), SharedPtr(off.as_mut_ptr()));
-    par_map((0..threads).collect(), |t| {
-        for k in n * t / threads..n * (t + 1) / threads {
-            if let Some(&x) = order.get(k + AHEAD) {
-                prefetch(&g.off[x as usize]);
-            }
-            let u = order[k] as usize; // order is a permutation, so u is this thread's alone
-            idp.set(u, k as u32);
-            degp.set(k + 1, g.off[u + 1] - g.off[u]);
+    let Graph { off, adj, big } = g;
+    drop((off, adj)); // the old graph is no longer needed
+    // The threads' orders, one after another, are the new ids; their list ends give `off`.
+    let (mut new_id, mut off) = (vec![0u32; n], vec![0u32; n + 1]);
+    let (idp, offp) = (SharedPtr(new_id.as_mut_ptr()), SharedPtr(off.as_mut_ptr()));
+    let (mut jobs, mut lists, mut base) = (Vec::new(), Vec::new(), (0, 0));
+    for (order, list, ends) in parts {
+        let next = (base.0 + order.len(), base.1 + list.len());
+        jobs.push((order, ends, base));
+        lists.push(list);
+        base = next;
+    }
+    par_map(jobs, |(order, ends, (k0, e0))| {
+        for (k, (&u, &end)) in order.iter().zip(&ends).enumerate() {
+            idp.set(u as usize, (k0 + k) as u32); // each node is in one order only
+            offp.set(k0 + k + 1, (e0 + end as usize) as u32);
         }
     });
-    for k in 0..n {
-        off[k + 1] += off[k];
-    }
-    // The old graph's heads, the big list and the queries get their new ids in place, so
-    // `new_id` is freed before the new graph exists: the copy is the run's memory peak.
+    // Each thread's lists go to their place, their heads given new ids on the way.
     let id = |x: u32| new_id[x as usize];
-    let size = g.adj.len().div_ceil(threads).max(1);
-    par_map(g.adj.chunks_mut(size).collect(), |part| {
-        part.iter_mut().for_each(|e| e.v = id(e.v));
-    });
-    g.big.iter_mut().for_each(|e| (e.0, e.1) = (id(e.0), id(e.1)));
-    g.big.sort_unstable();
-    queries.iter_mut().for_each(|q| *q = (id(q.0), id(q.1)));
-    drop(new_id);
-    // Copy each node's edge list to its new place, in parallel over ranges of new ids.
-    let mut adj = zero_edges(g.adj.len());
+    let mut adj = zero_edges(lists.iter().map(Vec::len).sum());
     let mut rest: &mut [Edge] = &mut adj;
     let mut jobs = Vec::new();
-    for t in 0..threads {
-        let (k0, k1) = (n * t / threads, n * (t + 1) / threads);
-        let (mine, tail) = std::mem::take(&mut rest).split_at_mut((off[k1] - off[k0]) as usize);
+    for list in lists {
+        let (mine, tail) = std::mem::take(&mut rest).split_at_mut(list.len());
         rest = tail;
-        jobs.push((k0, k1, mine));
+        jobs.push((mine, list));
     }
-    par_map(jobs, |(k0, k1, mine)| {
-        let mut slots = mine.iter_mut();
-        for k in k0..k1 {
-            if let Some(&x) = order.get(k + AHEAD) {
-                prefetch(&g.off[x as usize]);
-            }
-            if let Some(&x) = order.get(k + AHEAD / 2) {
-                prefetch(g.adj.as_ptr().wrapping_add(g.off[x as usize] as usize));
-            }
-            let u = order[k];
-            for &e in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize] {
-                *slots.next().unwrap() = e;
-            }
-        }
+    par_map(jobs, |(mine, list)| {
+        mine.iter_mut().zip(&list).for_each(|(d, &e)| *d = Edge { v: id(e.v), w: e.w });
     });
-    Graph { off, adj, big: g.big }
+    let mut big: Vec<_> = big.iter().map(|&(u, v, w)| (id(u), id(v), w)).collect();
+    big.sort_unstable();
+    queries.iter_mut().for_each(|q| *q = (id(q.0), id(q.1)));
+    Graph { off, adj, big }
 }
 
 /// A radix heap: a priority queue for keys that never go below the last key popped, as in
