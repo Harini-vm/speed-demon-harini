@@ -20,7 +20,7 @@ Best measured run per track, on the board's box (12 threads, full dataset, seed 
 | A | 46 ms | 27.2 MiB | 409 | 73.66 |
 | B | 470 ms | 77.8 MiB | 582 | 60.24 |
 | C | 54 ms | 19.6 MiB | 462 | 68.54 |
-| D | 196 ms | 91.5 MiB | 551 | 65.63 |
+| D | 152 ms | 79.7 MiB | 660 | 68.38 |
 
 Each PERF.md lists every step with the board run that measured it, including the steps that were measured worse and reverted.
 
