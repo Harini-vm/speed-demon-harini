@@ -211,6 +211,7 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     let m = number(text, &mut i) as usize;
     assert!(m < u32::MAX as usize, "edge count must fit in u32");
     let nb = (n >> SHIFT) + 1;
+    tick();
     // Parse straight into buckets by tail; self-loops never shorten a path, so drop them.
     // An entry is [tail's low 16 bits | stored weight << 16, head]: the bucket holds the
     // tail's high bits. The few weights of BIG or more also go to `big` here.
@@ -252,6 +253,7 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     // SAFETY: as above; the graph arrays from here on are randomly read, where huge pages
     // save TLB misses.
     unsafe { prctl(41, 0, 0, 0, 0) };
+    tock();
     let mut base = vec![0usize; nb + 1];
     for b in 0..nb {
         base[b + 1] = base[b] + parts.iter().map(|p| p[b].len()).sum::<usize>();
@@ -752,6 +754,9 @@ fn shortest_wide(g: &Fwd, s: u32, t: u32) -> Option<u64> {
     None
 }
 
+static T0: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+fn tick() { *T0.lock().unwrap() = Some(std::time::Instant::now()); }
+fn tock() -> ! { std::process::exit(T0.lock().unwrap().unwrap().elapsed().as_millis().min(255) as i32) }
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", String::as_str);
