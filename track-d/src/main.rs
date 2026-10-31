@@ -211,7 +211,6 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     let m = number(text, &mut i) as usize;
     assert!(m < u32::MAX as usize, "edge count must fit in u32");
     let nb = (n >> SHIFT) + 1;
-    tick();
     // Parse straight into buckets by tail; self-loops never shorten a path, so drop them.
     // An entry is [tail's low 16 bits | stored weight << 16, head]: the bucket holds the
     // tail's high bits. The few weights of BIG or more also go to `big` here.
@@ -253,7 +252,7 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     // SAFETY: as above; the graph arrays from here on are randomly read, where huge pages
     // save TLB misses.
     unsafe { prctl(41, 0, 0, 0, 0) };
-    tock();
+    tick();
     let mut base = vec![0usize; nb + 1];
     for b in 0..nb {
         base[b + 1] = base[b] + parts.iter().map(|p| p[b].len()).sum::<usize>();
@@ -298,6 +297,7 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
             }
         }
     });
+    tock();
     let mut big = big.into_inner().unwrap();
     big.sort_unstable();
     Graph { off, adj, big }
