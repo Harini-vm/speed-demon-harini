@@ -192,3 +192,15 @@ Also tried on the box: lists of up to four edges in fixed slots per node, so tha
 The search's reset zeroes the pages it handed out and their table entries, instead of every labelled node one by one, which also takes a push out of the relaxation loop. Edge weights are decoded by one helper, and the radix heap's refill reuses `push`'s bucket choice. 670 to 642 code lines after rustfmt, the same local time.
 
 Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, and with 1, 3 and 13 threads in a build without AVX2.
+
+Board, step 17: 68.082 (T 154.7 ms, M 82.6 MiB, S 651).
+
+## Step 18: list lengths in a byte
+
+The run's peak is the end of the BFS, where the old graph, the threads' list buffers, their orders and each list's end (4 bytes per node, 7 MB) all exist. A list's length now takes one byte; the few of 255 or more go to a short side list, in order. Local cgroup at 12 threads: 80 to 77 MB. A hand-made graph with a 300-edge hub (and weights 65,534, 65,535 and 2^32 - 1) matches the reference with 1, 3 and 12 threads.
+
+Box: 156.6 ms and 79.6 MiB, against 82.6 MiB for step 17.
+
+Box phase times for this step (each build exits with one phase's milliseconds as its exit code): parse 15 ms (done 21 ms after start), CSR 12 ms (memory there 69.6 MiB, against 52 MB in a local cgroup: the box's huge pages), BFS with the list buffers 20 ms (77.7 MiB), new ids and the copy 15 ms, reverse weights 17 ms, queries about 65 ms.
+
+Also measured on the box, not kept: the queries on 6 threads instead of 12 (178.5 and 177.9 ms against 162.3 and 183.0), and a second prefetch for the node after next (152.6 and 184.7 ms: no difference within the noise).
