@@ -511,7 +511,11 @@ impl Back {
             .collect();
         let found = par_map(ranges, |r| {
             let mut extra = Vec::new();
+            // Two-stage prefetch: the neighbours' offsets 8 nodes ahead, their lists 4 ahead.
+            let ahead = |x: usize| &g.adj[g.off[x.min(n - 1)] as usize..g.off[x.min(n - 1) + 1] as usize];
             for x in r {
+                ahead(x + 8).iter().for_each(|e| prefetch(&g.off[e.v as usize]));
+                ahead(x + 4).iter().for_each(|e| prefetch(g.adj.as_ptr().wrapping_add(g.off[e.v as usize] as usize)));
                 for j in g.off[x] as usize..g.off[x + 1] as usize {
                     let Edge { v: y, w } = g.adj[j];
                     let back = &g.adj[g.off[y as usize] as usize..g.off[y as usize + 1] as usize];
