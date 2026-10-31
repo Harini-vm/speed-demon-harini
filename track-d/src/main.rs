@@ -456,10 +456,12 @@ fn reverse(g: &Graph, threads: usize) -> Graph {
         .map(|t| n * t / threads..n * (t + 1) / threads)
         .collect();
     let parts = par_map(ranges, |r| {
-        let expect = (g.off[r.end] - g.off[r.start]) as usize / nb;
-        let mut buckets: Vec<Vec<(u32, u16, u16)>> = (0..nb)
-            .map(|_| Vec::with_capacity(expect + expect / 4 + 16))
-            .collect();
+        // Exact sizes: after the renumbering a range's heads are near it, not spread evenly.
+        let heads = &g.adj[g.off[r.start] as usize..g.off[r.end] as usize];
+        let mut count = vec![0; nb];
+        heads.iter().for_each(|e| count[(e.v >> SHIFT) as usize] += 1);
+        let mut buckets: Vec<Vec<(u32, u16, u16)>> =
+            count.into_iter().map(Vec::with_capacity).collect();
         for u in r {
             for &Edge { v, w } in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
                 buckets[(v >> SHIFT) as usize].push((u as u32, w, v as u16));
