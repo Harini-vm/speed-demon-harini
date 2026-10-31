@@ -756,26 +756,29 @@ fn main() {
     let g = relabel(graph, &mut queries, threads);
     let rev = Back::new(&g, threads);
 
-    // Queries sorted by source and handed out one at a time: the threads then all work in
-    // one moving part of the renumbered map, which the shared cache holds, and no thread is
-    // left finishing a run of long searches alone. Answers: i64, -1 unreachable.
+    // Queries sorted by source and handed out four at a time: the threads then all work in
+    // one moving part of the renumbered map, which the shared cache holds, and short runs
+    // keep a few long searches from leaving one thread last. Answers: i64, -1 unreachable.
     let mut by_source: Vec<usize> = (0..queries.len()).collect();
     by_source.sort_unstable_by_key(|&q| queries[q].0);
+    let runs: Vec<&[usize]> = by_source.chunks(4).collect();
     let answers: Vec<AtomicI64> = queries.iter().map(|_| AtomicI64::new(-1)).collect();
     let (next, n) = (AtomicUsize::new(0), g.off.len() - 1);
     par_map(vec![(); threads], |()| {
         let mut sides: Option<(Side, Side)> = None;
-        while let Some(&q) = by_source.get(next.fetch_add(1, Relaxed)) {
-            let (s, t) = queries[q];
-            let answer = if s == t {
-                Some(0)
-            } else if g.off[s as usize] == g.off[s as usize + 1] || !rev.has_in(t) {
-                None // no way out of s, or no way into t
-            } else {
-                let sides = sides.get_or_insert_with(|| (Side::new(n), Side::new(n)));
-                shortest(&g, &rev, sides, s, t).unwrap_or_else(|| shortest_wide(&g, s, t))
-            };
-            answers[q].store(answer.map_or(-1, |d| d as i64), Relaxed);
+        while let Some(run) = runs.get(next.fetch_add(1, Relaxed)) {
+            for &q in *run {
+                let (s, t) = queries[q];
+                let answer = if s == t {
+                    Some(0)
+                } else if g.off[s as usize] == g.off[s as usize + 1] || !rev.has_in(t) {
+                    None // no way out of s, or no way into t
+                } else {
+                    let sides = sides.get_or_insert_with(|| (Side::new(n), Side::new(n)));
+                    shortest(&g, &rev, sides, s, t).unwrap_or_else(|| shortest_wide(&g, s, t))
+                };
+                answers[q].store(answer.map_or(-1, |d| d as i64), Relaxed);
+            }
         }
     });
 
