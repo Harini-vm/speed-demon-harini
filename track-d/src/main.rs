@@ -252,7 +252,6 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     // SAFETY: as above; the graph arrays from here on are randomly read, where huge pages
     // save TLB misses.
     unsafe { prctl(41, 0, 0, 0, 0) };
-    tick();
     let mut base = vec![0usize; nb + 1];
     for b in 0..nb {
         base[b + 1] = base[b] + parts.iter().map(|p| p[b].len()).sum::<usize>();
@@ -297,7 +296,6 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
             }
         }
     });
-    tock();
     let mut big = big.into_inner().unwrap();
     big.sort_unstable();
     Graph { off, adj, big }
@@ -330,6 +328,7 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
     let n = g.off.len() - 1;
     let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let claim = |x: usize| !claimed[x].load(Relaxed) && !claimed[x].swap(true, Relaxed);
+    tick();
     // Each thread also appends every list it visits to its own `lists`: they are then the
     // new graph's edges in order, and need only a sequential copy, not a random read each.
     // SAFETY (prctl): only sets a flag of this process; the buffers fill sequentially,
@@ -378,6 +377,7 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
     });
     // SAFETY: as above.
     unsafe { prctl(41, 0, 0, 0, 0) };
+    tock();
     drop(claimed);
     let Graph { off, adj, big } = g;
     drop((off, adj)); // the old graph is no longer needed
