@@ -14,7 +14,8 @@ Every step from the reference to the final version, each with the live-board run
 | 7+8 | Huge pages off, name table committed in one call (one board run) | `d430b7c` | 0.066 | 25 | 457 | 20.35 | 65.510 |
 | 9 | Huge pages back on; the name table is still committed up front | `19aaf87` | 0.088 | 25 | 455 | 16.94 | 62.417 |
 | 10 | Reverted to the code of step 6 | `95c27fb` | 0.067 | 24 | 448 | 20.31 | 65.531 |
-| 11 | Name table of 2^17 slots instead of 2^18 | _fill in_ | | | | | |
+| 11 | Name table of 2^17 slots instead of 2^18 | `81d8989` | 0.061 | 20 | 448 | 21.83 | 67.407 |
+| 12 | Ids, region ids and amounts converted eight digits at a time | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -120,3 +121,11 @@ Board, step 10: the code of step 6 measured 67 ms, against 60 ms on its first ru
 ## Step 11: smaller name table
 
 The name table is about a third of this track's memory: 2^18 slots of 32 bytes, 8 MB, all of it touched. About 100,500 distinct names (full seeds 1 and 13) fit in 2^17 slots at three quarters full, 4 MB. Lookups probe a little further on average, and two slots share a cache line. Local cgroup at 12 threads: 21 to 17 MB; local time within noise. The generator's name pool is 100,000, well under the 131,072 limit, which the existing assert enforces.
+
+Board, step 11: M 23.6 to 19.3 MiB at the same time (67.407; 67.454 on a re-run).
+
+## Step 12: numbers without a loop per digit
+
+An instruction profile (callgrind, sample seed 1) counted about 450 instructions per 60-byte record, and the digit loop in `number` alone accounted for about 57 per record (id, region id and both parts of the amount). The field ends are already known from the separator walk, so each number now comes from one 8-byte load ending at its last digit. The bytes before the number are masked to zero digits, and pairs, quads and octets are combined (SWAR), as in Tracks A and D. A field of more than 8 digits, or one too close to the start of the buffer for the load, still takes the loop. Local, 2 threads, three alternating rounds of 9: about 10% faster.
+
+Correctness: identical SHA-256 to the reference on tiny seeds 1 to 25, sample seeds 1 to 6, full seeds 1 and 13, the worked example, the edge-case files, with 1, 3, 13 and 52 threads, and with a build without AVX2.

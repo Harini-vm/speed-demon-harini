@@ -171,6 +171,28 @@ fn number(b: &[u8]) -> u64 {
     b.iter().fold(0, |v, &c| v * 10 + u64::from(c - b'0'))
 }
 
+/// The decimal `buf[start..end]`, without a loop per digit when it has at most 8 digits
+/// and 8 bytes of the buffer end at `end`: that word is loaded, the bytes before the number
+/// masked to zero digits, and pairs, quads and octets combined (SWAR).
+#[inline(always)]
+fn decimal(buf: &[u8], start: usize, end: usize) -> u64 {
+    let len = end - start;
+    if len > 8 || end < 8 {
+        return number(&buf[start..end]);
+    }
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let mask = if len == 0 {
+        0
+    } else {
+        u64::MAX << (8 * (8 - len))
+    };
+    let w = u64::from_le_bytes(buf[end - 8..end].try_into().unwrap());
+    let d = (w & mask).wrapping_sub(ONES * u64::from(b'0') & mask);
+    let v = (d * 10 + (d >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let v = (v * 100 + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+    (v * 10_000 + (v >> 32)) & 0xFFFF_FFFF
+}
+
 /// Word `i` of a name, little-endian, zero-padded past its end. The load may read up to
 /// seven bytes past the name, which are always in the mapped file: a name is followed in
 /// its record by at least a quote or comma, a note, a region id and an amount (`,,1,0.00`).
@@ -343,19 +365,15 @@ fn parse(buf: &[u8], country_of: &[u8], names: &Names, (mut aggs, mut name_ids):
         let (e3, _) = seps.next();
         let (e4, _) = seps.next();
         // id, after the byte order mark a record may start with (it is not data)
-        let id = number(&buf[start + if buf[start] == BOM[0] { 3 } else { 0 }..e0]);
+        let id = decimal(buf, start + if buf[start] == BOM[0] { 3 } else { 0 }, e0);
         let (name, name_len) = text(buf, e0 + 1, e1, q1 - q0);
         let (_, note_len) = text(buf, e1 + 1, e2, q2 - q1);
-        let region = number(&buf[e2 + 1..e3]) as usize;
+        let region = decimal(buf, e2 + 1, e3) as usize;
         // amount: -?digits.dd, then the CR of a CRLF terminator if there is one
-        let mut amount_text = &buf[e3 + 1..e4];
-        if amount_text.last() == Some(&b'\r') {
-            amount_text = &amount_text[..amount_text.len() - 1];
-        }
-        let negative = amount_text[0] == b'-';
-        let digits = &amount_text[usize::from(negative)..];
-        let cents = number(&digits[..digits.len() - 3]) as i64 * 100
-            + number(&digits[digits.len() - 2..]) as i64;
+        let end = e4 - usize::from(buf[e4 - 1] == b'\r');
+        let negative = buf[e3 + 1] == b'-';
+        let cents = decimal(buf, e3 + 1 + usize::from(negative), end - 3) as i64 * 100
+            + decimal(buf, end - 2, end) as i64;
         let amount = if negative { -cents } else { cents };
         start = e4 + 1;
 
