@@ -9,7 +9,8 @@ Every step from the reference to the final version, each with the live-board run
 | 2 | SWAR number parsing, u32 heap keys, parallel renumbering bookkeeping | `5e6ffc1` | 0.236 | 199 | 482 | 16.50 | 60.873 |
 | 3 | Smaller source: the same logic in fewer lines | `e5a377e` | 0.230 | 202 | 436 | 16.90 | 61.394 |
 | 4 | Distances in a small page pool; parse buckets that free back to the OS | `1d33d23` | 0.217 | 114 | 469 | 19.28 | 64.257 |
-| 5 | Patch-shaped renumbering; queries handed out four at a time; parse buckets freed one by one | _fill in_ | | | | | |
+| 5 | Patch-shaped renumbering; queries handed out four at a time; parse buckets freed one by one | `acaedaf` | 0.196 | 111 | 488 | 20.30 | 65.375 |
+| 6 | Experiment: transparent huge pages off for the process | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -87,3 +88,7 @@ The searches are limited by memory latency, not instructions. A callgrind profil
 - **Parse buckets** are regrouped by bucket and each bucket's lists are freed right after the CSR build uses them: build phase peak 99 to 65 MB at 12 threads. The overall peak (about 101 MB) is now renumbering, with the old and new graphs both alive, and the queries.
 
 479 code lines. Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, and with 1, 3 and 13 threads.
+
+## Experiment: transparent huge pages
+
+On Track A, turning transparent huge pages off for the process (`prctl(PR_SET_THP_DISABLE)`) took the board's M from 50 to 38 MB with time unchanged. The box backs memory with 2 MB pages, and each one commits all its memory on its first write. This track measured closer to its local number already, so this step finds out whether the same line saves memory here too, and what it costs in time: huge pages also mean fewer TLB misses on large, randomly accessed arrays.
