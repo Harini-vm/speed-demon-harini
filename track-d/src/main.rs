@@ -22,6 +22,7 @@ use std::thread;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn prctl(option: i32, ...) -> i32;
 }
 
 /// Maps a whole file read-only. The harness pre-warms /data into the page cache.
@@ -218,37 +219,51 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     assert!(m < u32::MAX as usize, "edge count must fit in u32");
     let nb = (n >> SHIFT) + 1;
     // Parse straight into buckets by tail; self-loops never shorten a path, so drop them.
+    // An entry is [tail's low 16 bits | stored weight << 16, head]: the bucket holds the
+    // tail's high bits. The few weights of BIG or more also go to `big` here.
+    // Transparent huge pages are off while the buckets fill (PR_SET_THP_DISABLE = 41):
+    // the buckets' mmaps sit side by side, and a 2 MB page would commit their unused room.
+    // SAFETY: prctl only sets a flag of this process.
+    unsafe { prctl(41, 1, 0, 0, 0) };
+    let big = Mutex::new(Vec::new());
     let parts = par_map(split_lines(&text[i..], threads), |chunk| {
         // Every bucket gets its own capacity (`vec![v; nb]` would clone empty ones), about
         // 18 bytes of input per edge line: at full scale each is then above the mmap
         // threshold, so freeing it returns the memory instead of leaving it in this
         // thread's malloc arena.
         let expect = chunk.len() / 18 / nb;
-        let mut buckets: Vec<Vec<[u32; 3]>> = (0..nb)
+        let mut buckets: Vec<Vec<[u32; 2]>> = (0..nb)
             .map(|_| Vec::with_capacity(expect + expect / 4 + 16))
             .collect();
         let mut j = 0;
         while j < chunk.len() {
             let [u, v, w] = [0; 3].map(|_| number_fast(chunk, &mut j) as u32);
             if u != v {
-                buckets[(u >> SHIFT) as usize].push([u, v, w]);
+                let e = edge(v, w);
+                buckets[(u >> SHIFT) as usize].push([u & 0xFFFF | u32::from(e.w) << 16, v]);
+                if e.w == BIG {
+                    big.lock().unwrap().push((u, v, w)); // about 50 edges at full scale
+                }
             }
         }
         buckets
     });
+    // SAFETY: as above; the graph arrays from here on are randomly read, where huge pages
+    // save TLB misses.
+    unsafe { prctl(41, 0, 0, 0, 0) };
     let mut base = vec![0usize; nb + 1];
     for b in 0..nb {
         base[b + 1] = base[b] + parts.iter().map(|p| p[b].len()).sum::<usize>();
     }
     // Regroup by bucket, so each bucket's lists can be freed as soon as it is built.
-    let mut by_bucket: Vec<Vec<Vec<[u32; 3]>>> = (0..nb).map(|_| Vec::new()).collect();
+    let mut by_bucket: Vec<Vec<Vec<[u32; 2]>>> = (0..nb).map(|_| Vec::new()).collect();
     for part in parts {
         by_bucket
             .iter_mut()
             .zip(part)
             .for_each(|(b, list)| b.push(list));
     }
-    let by_bucket: Vec<Mutex<Vec<Vec<[u32; 3]>>>> = by_bucket.into_iter().map(Mutex::new).collect();
+    let by_bucket: Vec<Mutex<Vec<Vec<[u32; 2]>>>> = by_bucket.into_iter().map(Mutex::new).collect();
 
     // Counting sort, one bucket at a time: its degree counts fit in L1, and each bucket owns
     // a disjoint range of `off` and of `adj`, so no atomics are needed.
@@ -256,7 +271,7 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     off[n] = base[nb] as u32;
     let mut adj = zero_edges(base[nb]);
     let (offp, adjp) = (SharedPtr(off.as_mut_ptr()), SharedPtr(adj.as_mut_ptr()));
-    let (next, big) = (AtomicUsize::new(0), Mutex::new(Vec::new()));
+    let next = AtomicUsize::new(0);
     par_map(vec![(); threads], |()| {
         let mut cursor = vec![0u32; 1 << SHIFT];
         loop {
@@ -267,18 +282,16 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
             let lists = std::mem::take(&mut *by_bucket[b].lock().unwrap());
             let (lo, edges) = (b << SHIFT, || lists.iter().flatten());
             cursor.fill(0);
-            edges().for_each(|&[u, _, _]| cursor[u as usize - lo] += 1);
+            edges().for_each(|&[x, _]| cursor[x as usize & 0xFFFF] += 1);
             let mut c = base[b] as u32;
             for k in 0..(lo + (1 << SHIFT)).min(n) - lo {
                 offp.set(lo + k, c); // nodes lo.. belong to this bucket alone
                 (cursor[k], c) = (c, c + cursor[k]);
             }
-            for &[u, v, w] in edges() {
-                adjp.set(cursor[u as usize - lo] as usize, edge(v, w)); // so do its edge slots
-                cursor[u as usize - lo] += 1;
-                if w >= u32::from(BIG) {
-                    big.lock().unwrap().push((u, v, w));
-                }
+            for &[x, v] in edges() {
+                let (k, w) = (x as usize & 0xFFFF, (x >> 16) as u16);
+                adjp.set(cursor[k] as usize, Edge { v, w }); // so do its edge slots
+                cursor[k] += 1;
             }
         }
     });
@@ -288,7 +301,7 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
 }
 
 /// Renumbers the nodes in breadth-first order, so nodes that are close in the network
-/// are close in memory, and returns the renumbered graph with `new_id[old]`. The input ids
+/// are close in memory, and gives the queries their new ids too. The input ids
 /// are a random relabelling, which makes nearly every edge a cache miss; after this, a
 /// Dijkstra ball lives in a few compact ranges of `off`, `adj` and `dist`.
 ///
@@ -299,7 +312,21 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
 /// whole patches instead of thin slices of long breadth-first rings.
 const REGION: usize = 64;
 
-fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
+/// Starts loading the cache line at `p` (a hint: any address is safe).
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch never faults, whatever the address.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p.cast(), std::arch::x86_64::_MM_HINT_T0)
+    };
+}
+
+/// How many nodes ahead the walks over `order` prefetch: the old ids are random, so each
+/// node's offsets and edge list are cache misses, and these overlap them.
+const AHEAD: usize = 16;
+
+fn relabel(mut g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
     let n = g.off.len() - 1;
     let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let claim = |x: usize| !claimed[x].load(Relaxed) && !claimed[x].swap(true, Relaxed);
@@ -316,10 +343,14 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
                 order.push(seed);
                 while head < order.len() {
                     let u = order[head] as usize;
+                    if let Some(&x) = order.get(head + 1) {
+                        prefetch(g.adj.as_ptr().wrapping_add(g.off[x as usize] as usize));
+                    }
                     head += 1;
                     for &Edge { v, .. } in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
                         if order.len() - start < REGION {
                             if claim(v as usize) {
+                                prefetch(&g.off[v as usize]);
                                 order.push(v);
                             }
                         } else if !claimed[v as usize].load(Relaxed) {
@@ -341,6 +372,9 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
     let (idp, degp) = (SharedPtr(new_id.as_mut_ptr()), SharedPtr(off.as_mut_ptr()));
     par_map((0..threads).collect(), |t| {
         for k in n * t / threads..n * (t + 1) / threads {
+            if let Some(&x) = order.get(k + AHEAD) {
+                prefetch(&g.off[x as usize]);
+            }
             let u = order[k] as usize; // order is a permutation, so u is this thread's alone
             idp.set(u, k as u32);
             degp.set(k + 1, g.off[u + 1] - g.off[u]);
@@ -349,6 +383,17 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
     for k in 0..n {
         off[k + 1] += off[k];
     }
+    // The old graph's heads, the big list and the queries get their new ids in place, so
+    // `new_id` is freed before the new graph exists: the copy is the run's memory peak.
+    let id = |x: u32| new_id[x as usize];
+    let size = g.adj.len().div_ceil(threads).max(1);
+    par_map(g.adj.chunks_mut(size).collect(), |part| {
+        part.iter_mut().for_each(|e| e.v = id(e.v));
+    });
+    g.big.iter_mut().for_each(|e| (e.0, e.1) = (id(e.0), id(e.1)));
+    g.big.sort_unstable();
+    queries.iter_mut().for_each(|q| *q = (id(q.0), id(q.1)));
+    drop(new_id);
     // Copy each node's edge list to its new place, in parallel over ranges of new ids.
     let mut adj = zero_edges(g.adj.len());
     let mut rest: &mut [Edge] = &mut adj;
@@ -361,20 +406,20 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
     }
     par_map(jobs, |(k0, k1, mine)| {
         let mut slots = mine.iter_mut();
-        for &u in &order[k0..k1] {
-            for &Edge { v, w } in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize]
-            {
-                *slots.next().unwrap() = Edge {
-                    v: new_id[v as usize],
-                    w,
-                };
+        for k in k0..k1 {
+            if let Some(&x) = order.get(k + AHEAD) {
+                prefetch(&g.off[x as usize]);
+            }
+            if let Some(&x) = order.get(k + AHEAD / 2) {
+                prefetch(g.adj.as_ptr().wrapping_add(g.off[x as usize] as usize));
+            }
+            let u = order[k];
+            for &e in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize] {
+                *slots.next().unwrap() = e;
             }
         }
     });
-    let id = |x: u32| new_id[x as usize];
-    let mut big: Vec<_> = g.big.iter().map(|&(u, v, w)| (id(u), id(v), w)).collect();
-    big.sort_unstable();
-    (Graph { off, adj, big }, new_id)
+    Graph { off, adj, big: g.big }
 }
 
 /// A radix heap: a priority queue for keys that never go below the last key popped, as in
@@ -689,18 +734,15 @@ fn main() {
     // glibc keeps them in per-thread arenas and they count towards peak memory.
     // SAFETY: mallopt only tunes the allocator; it is called before any thread starts.
     unsafe { mallopt(-3, 128 * 1024) };
-    let (g, new_id) = relabel(
-        build_graph(map(&format!("{data_dir}/graph.txt")), threads),
-        threads,
-    );
     let qtext = map(&format!("{data_dir}/queries.txt"));
     let mut queries = Vec::new();
     let mut i = 0;
     while i < qtext.len() {
-        let s = new_id[number(qtext, &mut i) as usize];
-        queries.push((s, new_id[number(qtext, &mut i) as usize]));
+        let s = number(qtext, &mut i) as u32;
+        queries.push((s, number(qtext, &mut i) as u32));
     }
-    drop(new_id);
+    let graph = build_graph(map(&format!("{data_dir}/graph.txt")), threads);
+    let g = relabel(graph, &mut queries, threads);
     let rev = Back::new(&g, threads);
 
     // Queries sorted by source and handed out four at a time: the threads then all work in

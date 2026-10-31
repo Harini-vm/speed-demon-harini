@@ -134,3 +134,16 @@ Finding y -> x means scanning y's list for x. After the renumbering, y's list is
 The graph data for the queries goes from 74 MB (two graphs) to 47 MB (one graph and the array). Locally, at 2 threads: the queries take the same time, and building the array takes a little longer than the atomic reverse build did. On 12 threads it has no shared counters, unlike the reverse build.
 
 Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, and with 1, 3 and 13 threads in a build without AVX2.
+
+Board, step 11: 65.733 (T 191 ms, M 87.1 MiB) against 65.629, on a run where Track A, unchanged, measured 63 ms against its usual 46. Phase times on the box (builds that stop after a phase and report their time): parse and CSR 34 ms, BFS 21 ms, copy and reverse weights 80 ms, queries 56 ms. The queries were 80 ms with two graphs: one structure for both directions halves the data the searches pull through the cache. Memory at the CSR stop was already 86 MiB, so the build phase, not the renumbering, sets the box's peak; a local cgroup measures 68 MB there.
+
+## Step 12: build memory, prefetching
+
+- **8-byte parse entries.** A bucket entry was (tail, head, weight), 12 bytes. The bucket already gives the tail's high bits, and the weight is stored as 16 bits anyway, so an entry is now [tail's low 16 bits | stored weight, head]. The 50 weights of 65,534 or more go to the `big` list during the parse.
+- **No huge pages for the parse buckets.** Each thread's buckets are separate mmaps of about 200 KB, sized with room to spare. The kernel merges adjacent mappings, and on a box that backs memory with 2 MB pages, one write commits the spare room of its neighbours. Huge pages are now off while the buckets fill (`PR_SET_THP_DISABLE`) and back on for the graph arrays, whose random reads they speed up.
+- **`new_id` freed before the copy.** The old graph's heads, the `big` list and the queries are given their new ids in place first, so the copy only needs the old graph, `order` and the new graph.
+- **Prefetching.** The old ids are random, so in the BFS, the degree pass and the copy, every node's offsets and edge list are cache misses. Each walk now prefetches a few nodes ahead.
+
+Local cgroup peak at 12 threads: build phase 68 to 52 MB, whole run 85 to 78 MB. Local phases at 2 threads: parse 63 to 52 ms, CSR 30 to 23, BFS 77 to 61, copy 57 to 49.
+
+Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, and with 1, 3 and 13 threads in a build without AVX2.
