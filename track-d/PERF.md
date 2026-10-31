@@ -13,7 +13,8 @@ Every step from the reference to the final version, each with the live-board run
 | 6 | Experiment: transparent huge pages off for the process | `d430b7c` | 0.223 | 112 | 490 | 18.81 | 63.918 |
 | 7 | Reverted: huge pages back on (the code of step 5) | `81d8989` | 0.196 | 111 | 488 | 20.25 | 65.329 |
 | 8 | 6-byte edges: 16-bit weights, with the few larger ones in a side list | `094ec9f` | 0.196 | 96 | 551 | 20.60 | 65.629 |
-| 9 | Renumbering copies by old id, so the node order is freed before both graphs exist | _fill in_ | | | | | |
+| 9 | Renumbering copies by old id, so the node order is freed before both graphs exist | `8b1d2d3` | 0.196 | 101 | 555 | 20.36 | 65.411 |
+| 10 | Reverted to the code of step 8 | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -111,3 +112,5 @@ Board, step 8: M 106 to 91.5 MiB at the same time. The source grew by 63 lines, 
 ## Step 9
 
 During the renumbering's copy, the old graph, the new graph, `new_id` and the BFS `order` all existed together, and that is the run's peak. `order` is only needed to build `new_id`. The degrees and the copy now run over ranges of old ids, each node writing its list at its new offset, so `order` is freed first. Local cgroup at 12 threads: 88 to 85 MB, time within noise.
+
+Board, step 9: M went up, 91.5 to 95.9 MiB, against a 3 MB drop locally. The copy now writes each node's list at a random place in the new graph instead of in order, and the box backs memory with transparent huge pages, so the scattered first writes likely commit 2 MB pages early. Reverted to step 8.
