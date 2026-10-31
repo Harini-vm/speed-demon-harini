@@ -147,3 +147,7 @@ Board, step 11: 65.733 (T 191 ms, M 87.1 MiB) against 65.629, on a run where Tra
 Local cgroup peak at 12 threads: build phase 68 to 52 MB, whole run 85 to 78 MB. Local phases at 2 threads: parse 63 to 52 ms, CSR 30 to 23, BFS 77 to 61, copy 57 to 49.
 
 Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, and with 1, 3 and 13 threads in a build without AVX2.
+
+## Step 13: one query at a time
+
+Queries were handed out in runs of four, sorted by source. A simulation of 12 workers over each query's measured work (heap pops) puts the last thread's finish 8.8% after an even split with runs of four, and 4.8% with single queries. The searches stay sorted by source, so the threads still work in one moving part of the map.

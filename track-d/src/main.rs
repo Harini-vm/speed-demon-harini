@@ -743,9 +743,7 @@ fn main() {
     }
     let graph = build_graph(map(&format!("{data_dir}/graph.txt")), threads);
     let g = relabel(graph, &mut queries, threads);
-    let t0 = std::time::Instant::now();
     let rev = Back::new(&g, threads);
-    if rev.rw.len() > 1 { std::process::exit(t0.elapsed().as_millis().min(255) as i32); }
 
     // Queries sorted by source and handed out one at a time: the threads then all work in
     // one moving part of the renumbered map, which the shared cache holds, and no thread is
