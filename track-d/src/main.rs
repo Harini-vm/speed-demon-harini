@@ -336,7 +336,8 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
     let parts = par_map((0..threads).collect(), |t| {
         let mut order: Vec<u32> = Vec::with_capacity(n / threads + n / threads / 4);
         let mut lists: Vec<Edge> = Vec::with_capacity(g.adj.len() / threads + g.adj.len() / threads / 4);
-        let mut ends: Vec<u32> = Vec::with_capacity(order.capacity()); // where each list ends
+        // Each list's length as a byte, and the few of 255 or more as (index in order, length).
+        let (mut degs, mut long) = (Vec::with_capacity(order.capacity()), Vec::new());
         let mut seeds = std::collections::VecDeque::new();
         for root in n * t / threads..n * (t + 1) / threads {
             seeds.push_back(root as u32);
@@ -354,7 +355,10 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
                     head += 1;
                     let list = &g.adj[g.off[u] as usize..g.off[u + 1] as usize];
                     lists.extend_from_slice(list);
-                    ends.push(lists.len() as u32);
+                    degs.push(list.len().min(255) as u8);
+                    if list.len() >= 255 {
+                        long.push(list.len());
+                    }
                     for &Edge { v, .. } in list {
                         if order.len() - start < REGION {
                             if claim(v as usize) {
@@ -368,27 +372,29 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
                 }
             }
         }
-        (order, lists, ends)
+        (order, lists, (degs, long))
     });
     // SAFETY: as above.
     unsafe { prctl(41, 0, 0, 0, 0) };
     drop(claimed);
     let Graph { off, adj, big } = g;
     drop((off, adj)); // the old graph is no longer needed
-    // The threads' orders, one after another, are the new ids; their list ends give `off`.
+    // The threads' orders, one after another, are the new ids; their list lengths give `off`.
     let (mut new_id, mut off) = (vec![0u32; n], vec![0u32; n + 1]);
     let (idp, offp) = (SharedPtr(new_id.as_mut_ptr()), SharedPtr(off.as_mut_ptr()));
     let (mut jobs, mut lists, mut base) = (Vec::new(), Vec::new(), (0, 0));
-    for (order, list, ends) in parts {
+    for (order, list, degs) in parts {
         let next = (base.0 + order.len(), base.1 + list.len());
-        jobs.push((order, ends, base));
+        jobs.push((order, degs, base));
         lists.push((list, base.1));
         base = next;
     }
-    par_map(jobs, |(order, ends, (k0, e0))| {
-        for (k, (&u, &end)) in order.iter().zip(&ends).enumerate() {
+    par_map(jobs, |(order, (degs, long), (k0, mut end))| {
+        let mut long = long.into_iter();
+        for (k, (&u, &d)) in order.iter().zip(&degs).enumerate() {
             idp.set(u as usize, (k0 + k) as u32); // each node is in one order only
-            offp.set(k0 + k + 1, (e0 + end as usize) as u32);
+            end += if d < 255 { usize::from(d) } else { long.next().unwrap() };
+            offp.set(k0 + k + 1, end as u32);
         }
     });
     // Each thread's lists go to their place, their heads given new ids on the way.
