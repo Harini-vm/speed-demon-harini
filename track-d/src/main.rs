@@ -376,7 +376,6 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
     });
     // SAFETY: as above.
     unsafe { prctl(41, 0, 0, 0, 0) };
-    tick();
     drop(claimed);
     let Graph { off, adj, big } = g;
     drop((off, adj)); // the old graph is no longer needed
@@ -406,7 +405,6 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
         let new = |(k, e): (usize, &Edge)| adjp.set(e0 + k, Edge { v: id(e.v), w: e.w });
         list.iter().enumerate().for_each(new); // this thread's own range of edges
     });
-    tock();
     let mut big: Vec<_> = big.iter().map(|&(u, v, w)| (id(u), id(v), w)).collect();
     big.sort_unstable();
     queries.iter_mut().for_each(|q| *q = (id(q.0), id(q.1)));
@@ -754,9 +752,6 @@ fn shortest_wide(g: &Fwd, s: u32, t: u32) -> Option<u64> {
     None
 }
 
-static T0: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-fn tick() { *T0.lock().unwrap() = Some(std::time::Instant::now()); }
-fn tock() -> ! { std::process::exit(T0.lock().unwrap().unwrap().elapsed().as_millis().min(255) as i32) }
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", String::as_str);
