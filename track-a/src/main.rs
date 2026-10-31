@@ -28,6 +28,7 @@ const HOUR_CAP: usize = 72;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn prctl(option: i32, ...) -> i32;
 }
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
@@ -309,6 +310,11 @@ fn main() {
     // which large blocks come from per-thread arenas that keep their pages when freed.
     // SAFETY: mallopt only tunes the allocator; it is called before any thread starts.
     unsafe { mallopt(-3, 128 * 1024) };
+    // No transparent huge pages for this process (PR_SET_THP_DISABLE = 41): a 2 MB page
+    // commits all of its memory on the first write, which costs most where an array is
+    // only partly touched.
+    // SAFETY: prctl with this option only sets a flag on the calling process.
+    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let base_hour = days_from_civil(2026, 10, 30) * 24 + 18;
 
     // 1. Parse in parallel.

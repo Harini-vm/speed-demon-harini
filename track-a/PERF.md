@@ -11,7 +11,8 @@ Every step from the reference to the final version, each with the live-board run
 | 4 | Smaller source: the same logic in fewer lines | (shipped with step 5) | | | | | |
 | 5 | 6 bytes per line instead of 8, u32 cell counts, linear merge of endpoint names | (shipped with step 6) | | | | | |
 | 6 | Field ends from a 64-byte space/LF bitmask | `7c515ca` | 0.042 | 54 | 393 | 27.66 | 72.092 |
-| 7 | Fixed 128 KiB mmap threshold; cell table sized to the spec's 72 hours | _fill in_ | | | | | |
+| 7 | Fixed 128 KiB mmap threshold; cell table sized to the spec's 72 hours | `16b8be5` | 0.045 | 50 | 395 | 26.97 | 71.529 |
+| 8 | Experiment: transparent huge pages off for the process | _fill in_ | | | | | |
 
 ## Step 1
 
@@ -109,3 +110,9 @@ Board, step 6: T 43 to 42 ms and M unchanged at 54 MB. A local memory cgroup mea
 - **`HOUR_CAP` 256 to 72.** The spec fixes the span at exactly 72 hours for every seed and scale, and the existing assert stops the run on a timestamp outside it. Each thread's zero-allocated cell table goes from 2 MiB of address space to 576 KiB. Only touched pages were committed here, but a smaller range leaves nothing for the kernel to back with 2 MB pages on a box that uses them.
 
 Local cgroup peak at 12 threads: 45 MB to 34 MB. Time unchanged (min of 9, alternating). Correctness: identical SHA-256 to the reference on tiny seeds 1 to 12, sample seeds 1 to 7, full seeds 1 and 42, the worked example, an empty input, and with 1, 3 and 13 threads.
+
+## Step 8: what the box adds
+
+Board, step 7: M 54 to 50 MB (47.5 MiB) and T 42 to 45 ms. That is one run per push, so the time is within noise of step 6.
+
+After step 7, Tracks B, C and D measure within 4 to 8 MB of a local memory cgroup, but A is still about 16 MB above it (34 MB locally). The top teams' 16 to 20 MB on this track also shows that the box does not charge the 10 MB output to them in a way that adds up. So something in A's run, and only on the box, holds about 16 MB more. Transparent huge pages could do it: one 2 MB page commits all its memory on the first write. This step turns them off for the process with `prctl(PR_SET_THP_DISABLE)` and changes nothing else, so the next board run says whether they were the cause.
