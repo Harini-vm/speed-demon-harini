@@ -7,8 +7,9 @@ Every step from the reference to the final version, each with the live-board run
 | 0 | The reference, unchanged (scoring-box calibration) | | 32.05 | 228 | 56 | 1 | 0 |
 | 1 | Rust rewrite: mmap, parallel hand parsing, counting-sort scatter, select_nth percentiles, parallel formatting | `7d3b2cd` | 0.074 | 61 | 300 | 21.06 | 66.175 |
 | 2 | Branch-free parsing; counts kept per thread during the parse | `155b431` | 0.047 | 55 | 353 | 26.43 | 71.109 |
-| 3 | The serial steps between phases made parallel | _fill in_ | | | | | |
-| 4 | Smaller source: the same logic in fewer lines | _fill in_ | | | | | |
+| 3 | The serial steps between phases made parallel | `5c2e2da` | 0.043 | 54 | 407 | 27.06 | 71.618 |
+| 4 | Smaller source: the same logic in fewer lines | (shipped with step 5) | | | | | |
+| 5 | 6 bytes per line instead of 8, u32 cell counts, linear merge of endpoint names | _fill in_ | | | | | |
 
 ## Step 1
 
@@ -61,3 +62,25 @@ Source size is 15% of the exponent, and this file was 398 code lines against the
 The parallel sections shared one pattern, written out in full five times: spawn a thread per chunk, join, collect. A 6-line `par_map(items, f)` helper replaces each with one line. Endpoint ranks now use a stable sort over the concatenated per-thread sorted lists, which merges sorted runs in linear passes, instead of a hand-written merge loop. The 8-byte SWAR tier of `find_space` only ever handled the last bytes before a chunk boundary, which the plain byte search covers.
 
 398 to 344 code lines. Run time unchanged in alternating runs against the previous build. Correctness: identical SHA-256 to the reference on the full seed battery, the worked example, and with 1, 3 and 13 threads.
+
+## Step 5: memory
+
+The board's M (54 MB) is the peak of everything the run charges: anonymous memory plus the 10 MB output file in the page cache. To see the same number locally, I now run each build in its own memory cgroup (v1, `memory.max_usage_in_bytes`), with the input read beforehand as the harness does. With 12 forced threads the old build measured 50 MB, close to the board.
+
+The peak was the scatter step, where these all exist at once:
+- the per-line records, 8 bytes × 3.1 million = 25 MB;
+- the latencies being scattered, 12.4 MB;
+- each thread's cell table of `u64` (lines and errors), 72 hours × 2048 × 8 bytes × 12 threads = 14 MB.
+
+Changes:
+- **Per line, 6 bytes instead of 8.** The record was `cell << 32 | latency`, and the cell is `hour × 2048 + endpoint id`. The hour almost never changes from one line to the next, so each thread now keeps only a list of (line index, hour) pairs where it does change. Per line it keeps the latency (`u32`) and the endpoint id with the 5xx flag in one `u16`.
+- **`u32` cells.** Cells now count lines only. The scatter step counts 5xx lines straight into each group with shared atomic counters, which costs little because only a few lines are errors.
+- The scattered latencies are freed before the output is written, so they are not alive alongside the output's page cache.
+
+Tried and rejected: storing only where the latency sits in each line (4 bytes per line) and reading its digits again during the scatter. That reached 39 MB, but rereading 239 MB of text took the scatter from 7 ms to 27 ms (2 threads), more than the parse saved.
+
+The endpoint ranks also changed. The threads' sorted name lists are nearly identical, so main merges them in linear passes instead of sorting the concatenation (12 threads forced: about 6 ms to about 4.5 ms for that step).
+
+Peak at 12 threads, cgroup: 50 MB to 45 MB. Local time (2 threads, phase minima over 9 runs): 120 ms to 104 ms, which is within noise.
+
+371 code lines. Correctness: identical SHA-256 to the reference on tiny seeds 1 to 12, sample seeds 1 to 7, full seeds 1 and 42, the worked example, an empty input, and with 1, 3, 7 and 13 threads.

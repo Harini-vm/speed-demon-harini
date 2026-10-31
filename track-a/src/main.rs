@@ -3,8 +3,9 @@
 //! Pipeline:
 //! 1. mmap /data/requests.log (already in the page cache, so no copy and no anon memory).
 //! 2. Split it into one chunk per thread at line boundaries. Each thread parses its lines
-//!    by hand, interns endpoints in a small local hash table, counts lines and errors per
-//!    (hour, local endpoint) cell, and keeps one packed u64 (cell, latency) per line.
+//!    by hand, interns endpoints in a small local hash table, counts lines per (hour,
+//!    local endpoint) cell, and keeps per line its latency (u32) and its endpoint id with
+//!    the 5xx flag (u16). Hour changes are kept apart: they are rare.
 //! 3. Merge the endpoint names, sort them bytewise and give each a global rank. A group is
 //!    then `hour * n_endpoints + rank`, so group order is exactly the output order.
 //! 4. Counting sort: a prefix sum over groups turns every thread's cell counts into write
@@ -15,6 +16,7 @@
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::thread;
 
 /// A thread's cell for (hour, local endpoint id) is `hour * EP_CAP + id`. The spec fixes the
@@ -61,10 +63,13 @@ struct Parsed<'a> {
     names: Vec<&'a [u8]>,
     /// The same names, sorted bytewise (done here, in parallel, for the merge in main).
     sorted: Vec<&'a [u8]>,
-    /// Per line: cell << 32 | latency.
-    recs: Vec<u64>,
-    /// Per cell: errors << 32 | lines. Allocated zeroed, so untouched pages cost nothing.
-    cells: Vec<u64>,
+    /// Per line: the latency, and the endpoint id | 5xx << 15.
+    lats: Vec<u32>,
+    ids: Vec<u16>,
+    /// (line index, hour) wherever the hour changes from the line before.
+    hours: Vec<(u32, u32)>,
+    /// Per cell: lines. Allocated zeroed, so untouched pages cost nothing.
+    cells: Vec<u32>,
     max_hour: usize,
 }
 
@@ -102,26 +107,25 @@ fn find_space(buf: &[u8], mut i: usize) -> usize {
     i + buf[i..].iter().position(|&c| c == b' ').unwrap() // the last bytes, or no AVX2
 }
 
-/// Parses the latency digits starting at `q`; returns (value, index of the LF).
+/// The index of the LF that ends the latency starting at `q`.
 #[inline(always)]
-fn latency(buf: &[u8], q: usize) -> (u64, usize) {
+fn line_end(buf: &[u8], q: usize) -> usize {
     if q + 16 > buf.len() {
         // The last line of a chunk: too close to the end for word loads.
-        let nl = q + buf[q..].iter().position(|&c| c == b'\n').unwrap();
-        return (
-            buf[q..nl]
-                .iter()
-                .fold(0, |a, &c| a * 10 + u64::from(c - b'0')),
-            nl,
-        );
+        return q + buf[q..].iter().position(|&c| c == b'\n').unwrap();
     }
     // At most 10 digits, so the LF is in one of the next two words.
     let k = first_in_word(word(buf, q), b'\n');
-    let nl = if k < 8 {
+    if k < 8 {
         q + k
     } else {
         q + 8 + first_in_word(word(buf, q + 8), b'\n')
-    };
+    }
+}
+
+/// The decimal in `buf[q..nl]` (1 to 10 digits, with a line of at least 8 bytes before).
+#[inline(always)]
+fn latency(buf: &[u8], q: usize, nl: usize) -> u64 {
     // The last (up to) 8 digits, as one word ending at the LF. Bytes before the number are
     // masked to zero digits; then pairs, quads and octets are combined (2561, 6553601, ...).
     let keep = (nl - q).min(8);
@@ -133,7 +137,7 @@ fn latency(buf: &[u8], q: usize) -> (u64, usize) {
     let high = buf[q..nl - keep]
         .iter()
         .fold(0, |a, &c| a * 10 + u64::from(c - b'0'));
-    (high * 100_000_000 + low, nl)
+    high * 100_000_000 + low
 }
 
 /// Parses whole lines. Hours are counted from `base_hour` (the span start, 2026-10-30T18Z).
@@ -142,8 +146,10 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
     const SLOTS: usize = 1 << BITS; // > 4x the 1,842 endpoints, so probes stay short
     let mut table = vec![0u32; SLOTS]; // id + 1, 0 = empty
     let mut names: Vec<&[u8]> = Vec::with_capacity(2048);
-    let mut recs = Vec::with_capacity(buf.len() / 70);
-    let mut cells = vec![0u64; HOUR_CAP * EP_CAP];
+    let mut lats = Vec::with_capacity(buf.len() / 70);
+    let mut ids = Vec::with_capacity(buf.len() / 70);
+    let mut hours = Vec::new();
+    let mut cells = vec![0u32; HOUR_CAP * EP_CAP];
     let mut max_hour = 0;
     let (mut prev, mut hour) = ((u64::MAX, u64::MAX), 0);
     let mut p = 0;
@@ -158,6 +164,9 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
             assert!(hour < HOUR_CAP, "timestamp outside the supported span");
             max_hour = max_hour.max(hour);
             prev = key;
+            if hours.last().map_or(true, |&(_, h)| h != hour as u32) {
+                hours.push((ids.len() as u32, hour as u32));
+            }
         }
         // method: 3 to 7 letters, so its space is inside the word at p + 28
         let e = p + 29 + first_in_word(word(buf, p + 28), b' ');
@@ -187,10 +196,10 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
             }
         };
         // status: three digits; 5xx is an error. latency: digits up to LF.
-        let (lat, nl) = latency(buf, s + 5);
-        let cell = hour * EP_CAP + id;
-        cells[cell] += 1 + (u64::from(buf[s + 1] == b'5') << 32);
-        recs.push((cell as u64) << 32 | lat);
+        let nl = line_end(buf, s + 5);
+        cells[hour * EP_CAP + id] += 1;
+        lats.push(latency(buf, s + 5, nl) as u32);
+        ids.push(id as u16 | u16::from(buf[s + 1] == b'5') << 15);
         p = nl + 1;
     }
     let mut sorted = names.clone();
@@ -198,7 +207,9 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
     Parsed {
         names,
         sorted,
-        recs,
+        lats,
+        ids,
+        hours,
         cells,
         max_hour,
     }
@@ -288,26 +299,40 @@ fn main() {
     // 2. Global endpoint ranks, in byte order (slice Ord puts a proper prefix first). Each
     //    thread's names arrive sorted, and a stable sort merges sorted runs in linear passes.
     //    Each thread then maps ranks to its local ids (NONE where it never saw the name).
-    let mut all: Vec<&[u8]> = parts
-        .iter()
-        .flat_map(|p| p.sorted.iter().copied())
-        .collect();
-    all.sort();
-    all.dedup();
+    let mut all: Vec<&[u8]> = Vec::new();
+    for p in &parts {
+        // Union of two sorted, duplicate-free lists; they are nearly identical.
+        let (mut i, mut j, mut merged) = (0, 0, Vec::with_capacity(all.len() + 64));
+        while i < all.len() || j < p.sorted.len() {
+            let take = match (all.get(i), p.sorted.get(j)) {
+                (Some(a), Some(b)) => a.cmp(b),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                _ => std::cmp::Ordering::Greater,
+            };
+            merged.push(if take.is_gt() { p.sorted[j] } else { all[i] });
+            i += usize::from(take.is_le());
+            j += usize::from(take.is_ge());
+        }
+        all = merged;
+    }
     let (n_eps, n_hours) = (
         all.len(),
         parts.iter().map(|p| p.max_hour).max().unwrap_or(0) + 1,
     );
     let n_groups = n_hours * n_eps;
     const NONE: usize = usize::MAX;
-    let local_of = par_map(parts.iter().collect(), |p: &Parsed| {
-        let mut v = vec![NONE; n_eps];
-        p.names
+    let (local_of, rank_of): (Vec<_>, Vec<_>) = par_map(parts.iter().collect(), |p: &Parsed| {
+        let mut local = vec![NONE; n_eps];
+        let rank: Vec<usize> = p
+            .names
             .iter()
-            .enumerate()
-            .for_each(|(id, n)| v[all.binary_search(n).unwrap()] = id);
-        v
-    });
+            .map(|n| all.binary_search(n).unwrap())
+            .collect();
+        rank.iter().enumerate().for_each(|(id, &r)| local[r] = id);
+        (local, rank)
+    })
+    .into_iter()
+    .unzip();
 
     // 3. Prefix sum in output order, by hour: each hour's line total, a running sum over
     //    the hours, then all hours in parallel set their groups' starts and turn each
@@ -317,21 +342,17 @@ fn main() {
         let cells = parts
             .iter()
             .flat_map(|p| &p.cells[h * EP_CAP..h * EP_CAP + p.names.len()]);
-        hour_start[h + 1] = hour_start[h] + cells.map(|c| c & 0xFFFF_FFFF).sum::<u64>();
+        hour_start[h + 1] = hour_start[h] + cells.map(|&c| u64::from(c)).sum::<u64>();
     }
     let total = hour_start[n_hours];
-    let (mut start, mut errors) = (vec![0u32; n_groups + 1], vec![0u32; n_groups]);
+    let mut start = vec![0u32; n_groups + 1];
     start[n_groups] = total as u32;
-    let cells: Vec<SharedPtr<u64>> = parts
+    let cells: Vec<SharedPtr<u32>> = parts
         .iter_mut()
         .map(|p| SharedPtr(p.cells.as_mut_ptr()))
         .collect();
-    let hours: Vec<_> = start[..n_groups]
-        .chunks_mut(n_eps)
-        .zip(errors.chunks_mut(n_eps))
-        .enumerate()
-        .collect();
-    par_map(hours, |(h, (starts, errs))| {
+    let hours: Vec<_> = start[..n_groups].chunks_mut(n_eps).enumerate().collect();
+    par_map(hours, |(h, starts)| {
         let mut total = hour_start[h];
         for r in 0..n_eps {
             starts[r] = total as u32;
@@ -340,22 +361,33 @@ fn main() {
                 let c = unsafe { &mut *cell.at(h * EP_CAP + local[r]) };
                 if *c != 0 {
                     // (A zero cell is skipped: writing it would commit an untouched page.)
-                    errs[r] += (*c >> 32) as u32;
-                    (*c, total) = (total, total + (*c & 0xFFFF_FFFF));
+                    (*c, total) = (total as u32, total + u64::from(*c));
                 }
             }
         }
     });
 
-    // 4. Scatter latencies so every group is contiguous, then free the per-line records.
+    // 4. Scatter latencies so every group is contiguous, and count 5xx lines per group (few
+    //    lines, so shared atomic counters cost little). Then free the per-line records.
     let mut lats = vec![0u32; total as usize];
+    let errors: Vec<AtomicU32> = (0..n_groups).map(|_| AtomicU32::new(0)).collect();
     let dst = SharedPtr(lats.as_mut_ptr());
-    par_map(parts.iter_mut().collect(), |p: &mut Parsed| {
-        for &r in &p.recs {
-            let cursor = &mut p.cells[(r >> 32) as usize];
+    let jobs: Vec<_> = parts.iter_mut().zip(&rank_of).collect();
+    par_map(jobs, |(p, rank)| {
+        let (mut hour, mut next) = (0, 0);
+        for (k, (&lat, &r)) in p.lats.iter().zip(&p.ids).enumerate() {
+            if next < p.hours.len() && p.hours[next].0 as usize == k {
+                hour = p.hours[next].1 as usize;
+                next += 1;
+            }
+            let id = usize::from(r & 0x7FFF);
+            let cursor = &mut p.cells[hour * EP_CAP + id];
             // SAFETY: each (thread, group) owns its own disjoint index range.
-            unsafe { *dst.at(*cursor as usize) = r as u32 };
+            unsafe { *dst.at(*cursor as usize) = lat };
             *cursor += 1;
+            if r >> 15 != 0 {
+                errors[hour * n_eps + rank[id]].fetch_add(1, Relaxed);
+            }
         }
     });
     drop(parts);
@@ -398,7 +430,7 @@ fn main() {
             let p99 = *v.select_nth_unstable(r(99)).1;
             let p95 = *v[..=r(99)].select_nth_unstable(r(95)).1;
             let p50 = *v[..=r(95)].select_nth_unstable(r(50)).1;
-            let e = u64::from(errors[g]);
+            let e = u64::from(errors[g].load(Relaxed));
             o.extend_from_slice(hour_text[g / n_eps].as_bytes());
             o.extend_from_slice(all[g % n_eps]);
             for x in [
@@ -416,7 +448,8 @@ fn main() {
         }
         o
     });
-    // Every buffer goes straight to its place in the file, all at once.
+    drop(lats); // before the file's pages are charged
+                // Every buffer goes straight to its place in the file, all at once.
     let offsets = outputs
         .iter()
         .scan(0, |at, o| Some(std::mem::replace(at, *at + o.len() as u64)));
