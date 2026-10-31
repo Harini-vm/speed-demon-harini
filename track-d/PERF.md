@@ -122,3 +122,5 @@ Box profiling (a build that printed phase times and exited) showed the reverse g
 Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, with 1, 3 and 13 threads, and with a build without AVX2.
 
 Board, step 10: T 196 to 189 ms, but M 91.5 to 107 MiB. Each thread's buckets were sized for edges spread evenly over the head ranges. After the renumbering a range's heads lie mostly near it, so a few buckets grew by doubling several times. Each thread now counts its buckets first and allocates them at their exact size.
+
+Board, exact sizes: M 106.6 MiB, T 188 ms. The extra memory is not the buckets' spare capacity: it is the 40 MB of buckets themselves, alive at the same time as the forward graph and the reverse graph being filled. That set the peak on the box, though not in a local cgroup. A 4% time gain does not pay for 16% more memory, so the reverse graph is built with atomic counters again, as in step 8.
