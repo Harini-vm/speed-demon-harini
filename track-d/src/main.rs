@@ -333,6 +333,7 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
     });
     drop(claimed);
     let order: Vec<u32> = orders.concat();
+    if order.len() > 1 { std::process::exit(3); }
     drop(orders);
     // new_id[old] and each node's degree, in parallel: both are random reads or writes
     // over 1.74 million nodes, too slow as one thread's loop.
@@ -689,10 +690,8 @@ fn main() {
     // glibc keeps them in per-thread arenas and they count towards peak memory.
     // SAFETY: mallopt only tunes the allocator; it is called before any thread starts.
     unsafe { mallopt(-3, 128 * 1024) };
-    let g0 = build_graph(map(&format!("{data_dir}/graph.txt")), threads);
-    if g0.off.len() > 2 { std::process::exit(3); }
     let (g, new_id) = relabel(
-        g0,
+        build_graph(map(&format!("{data_dir}/graph.txt")), threads),
         threads,
     );
     let qtext = map(&format!("{data_dir}/queries.txt"));
