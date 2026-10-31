@@ -431,7 +431,6 @@ fn main() {
         }
     });
     drop(parts);
-    if n_groups > 0 { std::process::exit(3) } // PROFILE: stop after the scatter
 
     // 5. Percentiles and formatting, groups split into ranges of about equal latency count.
     let hour_text: Vec<String> = (0..n_hours as i64)

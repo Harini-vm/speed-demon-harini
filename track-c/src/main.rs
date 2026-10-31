@@ -543,7 +543,6 @@ fn main() {
             }
         });
     }
-    if threads > 0 { std::process::exit(3) } // PROFILE: stop after all rounds
     let distinct: Vec<u32> = seen
         .iter()
         .map(|row| row.iter().map(|w| w.count_ones()).sum())
