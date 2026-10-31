@@ -12,6 +12,7 @@ Every step from the reference to the final version, each with the live-board run
 | 5 | regions.csv parsed in parallel in one pass; name slots prefetched four records ahead | `7c515ca` | 0.067 | 47 | 444 | 17.90 | 62.638 |
 | 6 | Fixed 128 KiB mmap threshold; name bitmaps grown to the ids in use | `16b8be5` | 0.060 | 25 | 448 | 21.53 | 66.652 |
 | 7 | Experiment: transparent huge pages off for the process | _fill in_ | | | | | |
+| 8 | Name table committed in one call before the parse | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -99,3 +100,11 @@ Local: 21 MB peak at 12 threads, time unchanged. This step tests what the box ch
 ## Experiment: transparent huge pages
 
 On Track A, turning transparent huge pages off for the process (`prctl(PR_SET_THP_DISABLE)`) took the board's M from 50 to 38 MB with time unchanged. The box backs memory with 2 MB pages, and each one commits all its memory on its first write. This track measured closer to its local number already, so this step finds out whether the same line saves memory here too, and what it costs in time: huge pages also mean fewer TLB misses on large, randomly accessed arrays.
+
+## Step 8: page faults
+
+Phase timings showed the first parse round taking about 70 to 90 ms against about 36 to 50 ms for each later round (2 threads). The first round inserts the 100,000 names and touches every page of the 8 MB name table for the first time. Writing one byte per page of the table before the parse took the first round down by 15 to 20 ms, while the touching itself cost about 3 ms: two threads first-touching the same table fault it in page by page and contend in the kernel. The table is now committed in one call (`madvise(MADV_POPULATE_WRITE)`, about 2 ms, best effort on older kernels).
+
+Local, 2 threads, three alternating rounds of 9: about 8 to 10% faster. The same call on Track A's latency array and Track D's adjacency arrays gave no gain there (both are written in order, so their faults do not contend), so it is used only here.
+
+Correctness: identical SHA-256 to the reference on tiny seeds 1 to 25, sample seeds 1 to 6, full seeds 1 and 13, the worked example, the edge-case files, and with 1, 3 and 13 threads.

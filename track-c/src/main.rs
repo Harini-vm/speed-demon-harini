@@ -20,6 +20,19 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+}
+
+/// Commits the pages under `v` in one call (MADV_POPULATE_WRITE = 23). Twelve threads
+/// first-touching a table fault it in page by page and contend in the kernel while doing
+/// so; one call up front is several times cheaper. Best effort: on a kernel without it,
+/// the pages simply fault in as before.
+fn populate<T>(v: &mut [T]) {
+    let at = v.as_mut_ptr() as usize;
+    let page = at & !4095; // madvise wants a page-aligned start
+                           // SAFETY: the range covers only `v`'s own memory and the start of its page, all of it
+                           // mapped; populating leaves the (zeroed) contents as they are.
+    unsafe { madvise(page as *mut u8, at - page + std::mem::size_of_val(v), 23) };
 }
 
 /// Maps a whole file read-only. The harness pre-warms /data into the page cache.
@@ -497,6 +510,7 @@ fn main() {
     // Shared name storage: 2^18 slots (about 100,000 names fill under two fifths of them),
     // and room for every record to bring a long name, of which only used pages are touched.
     let mut slot_mem = vec![0u64; 4 << 18];
+    populate(&mut slot_mem); // every page of it is written while parsing
     let mut long_mem = vec![0u64; body.len() / 2 + 1024];
     // Per-country name bitmaps, each grown to the ids handed out so far when it is folded:
     // no row is sized for ids that never come.
