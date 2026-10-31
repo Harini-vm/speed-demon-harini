@@ -10,7 +10,8 @@ Every step from the reference to the final version, each with the live-board run
 | 3 | Smaller source: the same logic in fewer lines | `e5a377e` | 0.230 | 202 | 436 | 16.90 | 61.394 |
 | 4 | Distances in a small page pool; parse buckets that free back to the OS | `1d33d23` | 0.217 | 114 | 469 | 19.28 | 64.257 |
 | 5 | Patch-shaped renumbering; queries handed out four at a time; parse buckets freed one by one | `acaedaf` | 0.196 | 111 | 488 | 20.30 | 65.375 |
-| 6 | Experiment: transparent huge pages off for the process | _fill in_ | | | | | |
+| 6 | Experiment: transparent huge pages off for the process | `d430b7c` | 0.223 | 112 | 490 | 18.81 | 63.918 |
+| 7 | Reverted: huge pages back on (the code of step 5) | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -92,3 +93,5 @@ The searches are limited by memory latency, not instructions. A callgrind profil
 ## Experiment: transparent huge pages
 
 On Track A, turning transparent huge pages off for the process (`prctl(PR_SET_THP_DISABLE)`) took the board's M from 50 to 38 MB with time unchanged. The box backs memory with 2 MB pages, and each one commits all its memory on its first write. This track measured closer to its local number already, so this step finds out whether the same line saves memory here too, and what it costs in time: huge pages also mean fewer TLB misses on large, randomly accessed arrays.
+
+Board, huge pages off: the memory did not move here, and the time got worse. A re-run of Track B's unchanged code in the same push was 7% slower than its earlier run, so part of that is the box. The rest is what huge pages buy on large, randomly read arrays (fewer TLB misses). Turning them off helped only Track A, whose arrays are partly touched. They are back on for this track.

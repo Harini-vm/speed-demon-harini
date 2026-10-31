@@ -19,7 +19,6 @@ use std::thread;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
-    fn prctl(option: i32, ...) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
@@ -454,12 +453,6 @@ fn main() {
     // which large blocks come from per-thread arenas that keep their pages when freed.
     // SAFETY: mallopt only tunes the allocator; it is called before any thread starts.
     unsafe { mallopt(-3, 128 * 1024) };
-    // No transparent huge pages for this process (PR_SET_THP_DISABLE = 41): a 2 MB page
-    // commits all of its memory on the first write, which costs most where memory is
-    // only partly touched.
-    // SAFETY: prctl with this option only sets a flag on the calling process.
-    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
-
     // regions.csv: "region_id,country" lines after a header, ids ascending, codes [A-Z]{3}.
     // A code's base-26 key sorts like the code itself, so walking the 26^3 table in key
     // order hands out ranks in output order with no sort.
