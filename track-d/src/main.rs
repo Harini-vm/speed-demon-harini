@@ -132,10 +132,74 @@ impl<T> SharedPtr<T> {
     }
 }
 
-/// The graph in CSR form: the out-edges of `u` are `adj[off[u]..off[u + 1]]`.
+/// An edge in 6 bytes: its other end and its weight. A weight of 65,535 or more is stored
+/// as 65,535 and looked up in the graph's `big` list (about 50 edges at full scale).
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct Edge {
+    v: u32,
+    w: u16,
+}
+
+/// `n` zero edges, allocated zeroed: `vec![edge(0, 0); n]` would write each one in turn,
+/// while zeroed memory is committed only as the threads fill it.
+fn zero_edges(n: usize) -> Vec<Edge> {
+    let layout = std::alloc::Layout::array::<Edge>(n).unwrap();
+    if layout.size() == 0 {
+        return Vec::new();
+    }
+    // SAFETY: an all-zero Edge is a valid Edge, the pointer comes from the global allocator
+    // with this exact layout (align 1), and length and capacity are both n.
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout).cast::<Edge>();
+        assert!(!ptr.is_null(), "out of memory");
+        Vec::from_raw_parts(ptr, n, n)
+    }
+}
+
+fn edge(v: u32, w: u32) -> Edge {
+    Edge {
+        v,
+        w: w.min(u32::from(u16::MAX)) as u16,
+    }
+}
+
+/// The graph in CSR form: the edges of `u` are `adj[off[u]..off[u + 1]]`. `big` holds
+/// (u, v, weight) for every edge whose weight did not fit, sorted.
 struct Graph {
     off: Vec<u32>,
-    adj: Vec<(u32, u32)>,
+    adj: Vec<Edge>,
+    big: Vec<(u32, u32, u32)>,
+}
+
+impl Graph {
+    /// The edges of `u` as (other end, weight).
+    #[inline(always)]
+    fn edges(&self, u: u32) -> impl Iterator<Item = (u32, u64)> + '_ {
+        let list = &self.adj[self.off[u as usize] as usize..self.off[u as usize + 1] as usize];
+        list.iter().map(move |&e| {
+            let (v, w) = (e.v, e.w);
+            (
+                v,
+                if w != u16::MAX {
+                    u64::from(w)
+                } else {
+                    self.big_weight(u, v)
+                },
+            )
+        })
+    }
+
+    /// A stored weight of 65,535 from `u` to `v`: the smallest such edge's real weight
+    /// (parallel edges may share the pair; any of their weights is a real edge).
+    #[cold]
+    fn big_weight(&self, u: u32, v: u32) -> u64 {
+        let i = self.big.partition_point(|&(a, b, _)| (a, b) < (u, v));
+        let same = self.big[i..]
+            .iter()
+            .take_while(|&&(a, b, _)| (a, b) == (u, v));
+        u64::from(same.map(|e| e.2).min().unwrap())
+    }
 }
 
 /// A bucket holds the edges whose tail is in one run of 65,536 consecutive node ids: small
@@ -185,9 +249,9 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     // a disjoint range of `off` and of `adj`, so no atomics are needed.
     let mut off = vec![0u32; n + 1];
     off[n] = base[nb] as u32;
-    let mut adj = vec![(0u32, 0u32); base[nb]];
+    let mut adj = zero_edges(base[nb]);
     let (offp, adjp) = (SharedPtr(off.as_mut_ptr()), SharedPtr(adj.as_mut_ptr()));
-    let next = AtomicUsize::new(0);
+    let (next, big) = (AtomicUsize::new(0), Mutex::new(Vec::new()));
     par_map(vec![(); threads], |()| {
         let mut cursor = vec![0u32; 1 << SHIFT];
         loop {
@@ -205,12 +269,17 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
                 (cursor[k], c) = (c, c + cursor[k]);
             }
             for &[u, v, w] in edges() {
-                adjp.set(cursor[u as usize - lo] as usize, (v, w)); // so do its edge slots
+                adjp.set(cursor[u as usize - lo] as usize, edge(v, w)); // so do its edge slots
                 cursor[u as usize - lo] += 1;
+                if w >= u32::from(u16::MAX) {
+                    big.lock().unwrap().push((u, v, w));
+                }
             }
         }
     });
-    Graph { off, adj }
+    let mut big = big.into_inner().unwrap();
+    big.sort_unstable();
+    Graph { off, adj, big }
 }
 
 /// Renumbers the nodes in breadth-first order, so nodes that are close in the network
@@ -243,7 +312,7 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
                 while head < order.len() {
                     let u = order[head] as usize;
                     head += 1;
-                    for &(v, _) in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
+                    for &Edge { v, .. } in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
                         if order.len() - start < REGION {
                             if claim(v as usize) {
                                 order.push(v);
@@ -276,8 +345,8 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
         off[k + 1] += off[k];
     }
     // Copy each node's edge list to its new place, in parallel over ranges of new ids.
-    let mut adj = vec![(0u32, 0u32); g.adj.len()];
-    let mut rest: &mut [(u32, u32)] = &mut adj;
+    let mut adj = zero_edges(g.adj.len());
+    let mut rest: &mut [Edge] = &mut adj;
     let mut jobs = Vec::new();
     for t in 0..threads {
         let (k0, k1) = (n * t / threads, n * (t + 1) / threads);
@@ -288,12 +357,19 @@ fn relabel(g: Graph, threads: usize) -> (Graph, Vec<u32>) {
     par_map(jobs, |(k0, k1, mine)| {
         let mut slots = mine.iter_mut();
         for &u in &order[k0..k1] {
-            for &(v, w) in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize] {
-                *slots.next().unwrap() = (new_id[v as usize], w);
+            for &Edge { v, w } in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize]
+            {
+                *slots.next().unwrap() = Edge {
+                    v: new_id[v as usize],
+                    w,
+                };
             }
         }
     });
-    (Graph { off, adj }, new_id)
+    let id = |x: u32| new_id[x as usize];
+    let mut big: Vec<_> = g.big.iter().map(|&(u, v, w)| (id(u), id(v), w)).collect();
+    big.sort_unstable();
+    (Graph { off, adj, big }, new_id)
 }
 
 /// A radix heap: a priority queue for keys that never go below the last key popped, as in
@@ -357,7 +433,7 @@ fn reverse(g: &Graph, threads: usize) -> Graph {
         .map(|t| n * t / threads..n * (t + 1) / threads)
         .collect();
     par_map(ranges.clone(), |r| {
-        for &(v, _) in &g.adj[g.off[r.start] as usize..g.off[r.end] as usize] {
+        for &Edge { v, .. } in &g.adj[g.off[r.start] as usize..g.off[r.end] as usize] {
             indeg[v as usize].fetch_add(1, Relaxed);
         }
     });
@@ -366,20 +442,22 @@ fn reverse(g: &Graph, threads: usize) -> Graph {
         off[v + 1] = off[v] + indeg[v].load(Relaxed);
         indeg[v].store(off[v], Relaxed); // now the write cursor of v
     }
-    let mut adj = vec![(0u32, 0u32); g.adj.len()];
+    let mut adj = zero_edges(g.adj.len());
     let dst = SharedPtr(adj.as_mut_ptr());
     par_map(ranges, |r| {
         for u in r {
-            for &(v, w) in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
+            for &Edge { v, w } in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
                 // fetch_add hands every in-edge its own slot
                 dst.set(
                     indeg[v as usize].fetch_add(1, Relaxed) as usize,
-                    (u as u32, w),
+                    Edge { v: u as u32, w },
                 );
             }
         }
     });
-    Graph { off, adj }
+    let mut big: Vec<_> = g.big.iter().map(|&(u, v, w)| (v, u, w)).collect();
+    big.sort_unstable();
+    Graph { off, adj, big }
 }
 
 /// Node v's distance lives on page `v >> PAGE_BITS` of a small pool, so a search uses
@@ -459,8 +537,8 @@ impl Side {
         if d + 1 > u64::from(self.dist(u)) {
             return; // stale entry
         }
-        for &(v, w) in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize] {
-            let nd = d + u64::from(w);
+        for (v, w) in g.edges(u) {
+            let nd = d + w;
             if nd >= u64::from(u32::MAX) {
                 *wide = true;
                 continue;
@@ -524,8 +602,8 @@ fn shortest_wide(g: &Graph, s: u32, t: u32) -> Option<u64> {
         if u == t {
             return Some(d);
         }
-        for &(v, w) in &g.adj[g.off[u as usize] as usize..g.off[u as usize + 1] as usize] {
-            let nd = d + u64::from(w);
+        for (v, w) in g.edges(u) {
+            let nd = d + w;
             if dist.get(&v).map_or(true, |&x| nd < x) {
                 dist.insert(v, nd);
                 heap.push(Reverse((nd, v)));

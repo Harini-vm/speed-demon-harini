@@ -11,7 +11,8 @@ Every step from the reference to the final version, each with the live-board run
 | 4 | Distances in a small page pool; parse buckets that free back to the OS | `1d33d23` | 0.217 | 114 | 469 | 19.28 | 64.257 |
 | 5 | Patch-shaped renumbering; queries handed out four at a time; parse buckets freed one by one | `acaedaf` | 0.196 | 111 | 488 | 20.30 | 65.375 |
 | 6 | Experiment: transparent huge pages off for the process | `d430b7c` | 0.223 | 112 | 490 | 18.81 | 63.918 |
-| 7 | Reverted: huge pages back on (the code of step 5) | _fill in_ | | | | | |
+| 7 | Reverted: huge pages back on (the code of step 5) | `81d8989` | 0.196 | 111 | 488 | 20.25 | 65.329 |
+| 8 | 6-byte edges: 16-bit weights, with the few larger ones in a side list | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -95,3 +96,11 @@ The searches are limited by memory latency, not instructions. A callgrind profil
 On Track A, turning transparent huge pages off for the process (`prctl(PR_SET_THP_DISABLE)`) took the board's M from 50 to 38 MB with time unchanged. The box backs memory with 2 MB pages, and each one commits all its memory on its first write. This track measured closer to its local number already, so this step finds out whether the same line saves memory here too, and what it costs in time: huge pages also mean fewer TLB misses on large, randomly accessed arrays.
 
 Board, huge pages off: the memory did not move here, and the time got worse. A re-run of Track B's unchanged code in the same push was 7% slower than its earlier run, so part of that is the box. The rest is what huge pages buy on large, randomly read arrays (fewer TLB misses). Turning them off helped only Track A, whose arrays are partly touched. They are back on for this track.
+
+## Step 8: 6-byte edges
+
+Each graph held its edges as (head u32, weight u32), 8 bytes. Every peak is set by graphs: about 47 MB each for the old and new graph during the renumbering, and for the forward and reverse graph during the queries. Weights here are travel times, and on full seed 1 all but 50 of the 5 million fit in 16 bits. An edge is now a packed (u32, u16), 6 bytes. A weight of 65,535 or more is stored as 65,535, and the search looks it up in the graph's sorted `big` list of (tail, head, weight), which the renumbering and the reverse graph remap like the edges. Parallel edges that share a pair also share the lookup's answer, the smallest of their large weights; that is the weight of a real edge, so shortest paths are unchanged.
+
+Allocation matters for a type that is not a plain number: `vec![edge(0, 0); n]` writes every element in turn (about 10 ms per graph on one thread), so the edge arrays are now allocated zeroed and committed as the threads fill them.
+
+Local cgroup at 12 threads: 104 to 88 MB. Phase times within noise of before. Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9 (they include the 2^32 - 1 and over-2^32 answers), the worked example, with 1, 3 and 13 threads, and with a build without AVX2.
