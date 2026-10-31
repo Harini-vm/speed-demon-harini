@@ -15,7 +15,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 use std::thread;
 
@@ -206,6 +206,61 @@ impl Graph {
 /// enough for its counts to stay in L2, big enough for its vectors to be mmap-backed.
 const SHIFT: u32 = 16;
 
+/// Lays out bucketed edge records as CSR. `parts[t][b]` holds thread t's records whose node
+/// is in bucket b (node ids from b << SHIFT); `low` gives a record's node within its bucket.
+/// Counting sort, one bucket per worker at a time: its counts fit in L2, and each bucket
+/// owns disjoint ranges of `off` and `adj`, so no atomics are needed. A bucket's lists are
+/// freed as soon as it is laid out.
+fn place<R: Copy + Send>(
+    n: usize,
+    parts: Vec<Vec<Vec<R>>>,
+    threads: usize,
+    low: impl Fn(R) -> usize + Sync,
+    edge: impl Fn(R) -> Edge + Sync,
+) -> (Vec<u32>, Vec<Edge>) {
+    let nb = (n >> SHIFT) + 1;
+    let mut base = vec![0usize; nb + 1];
+    for b in 0..nb {
+        base[b + 1] = base[b] + parts.iter().map(|p| p[b].len()).sum::<usize>();
+    }
+    let mut by_bucket: Vec<Vec<Vec<R>>> = (0..nb).map(|_| Vec::new()).collect();
+    for part in parts {
+        by_bucket
+            .iter_mut()
+            .zip(part)
+            .for_each(|(b, list)| b.push(list));
+    }
+    let by_bucket: Vec<Mutex<Vec<Vec<R>>>> = by_bucket.into_iter().map(Mutex::new).collect();
+    let mut off = vec![0u32; n + 1];
+    off[n] = base[nb] as u32;
+    let mut adj = zero_edges(base[nb]);
+    let (offp, adjp) = (SharedPtr(off.as_mut_ptr()), SharedPtr(adj.as_mut_ptr()));
+    let next = AtomicUsize::new(0);
+    par_map(vec![(); threads], |()| {
+        let mut cursor = vec![0u32; 1 << SHIFT];
+        loop {
+            let b = next.fetch_add(1, Relaxed);
+            if b >= nb {
+                break;
+            }
+            let lists = std::mem::take(&mut *by_bucket[b].lock().unwrap());
+            let (lo, records) = (b << SHIFT, || lists.iter().flatten().copied());
+            cursor.fill(0);
+            records().for_each(|r| cursor[low(r)] += 1);
+            let mut c = base[b] as u32;
+            for k in 0..(lo + (1 << SHIFT)).min(n) - lo {
+                offp.set(lo + k, c); // nodes lo.. belong to this bucket alone
+                (cursor[k], c) = (c, c + cursor[k]);
+            }
+            for r in records() {
+                adjp.set(cursor[low(r)] as usize, edge(r)); // so do its edge slots
+                cursor[low(r)] += 1;
+            }
+        }
+    });
+    (off, adj)
+}
+
 fn build_graph(text: &[u8], threads: usize) -> Graph {
     let mut i = 0;
     let n = number(text, &mut i) as usize;
@@ -213,6 +268,7 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     assert!(m < u32::MAX as usize, "edge count must fit in u32");
     let nb = (n >> SHIFT) + 1;
     // Parse straight into buckets by tail; self-loops never shorten a path, so drop them.
+    let big = Mutex::new(Vec::new());
     let parts = par_map(split_lines(&text[i..], threads), |chunk| {
         // Every bucket gets its own capacity (`vec![v; nb]` would clone empty ones), about
         // 18 bytes of input per edge line: at full scale each is then above the mmap
@@ -227,56 +283,20 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
             let [u, v, w] = [0; 3].map(|_| number_fast(chunk, &mut j) as u32);
             if u != v {
                 buckets[(u >> SHIFT) as usize].push([u, v, w]);
+                if w >= u32::from(u16::MAX) {
+                    big.lock().unwrap().push((u, v, w)); // about 50 edges at full scale
+                }
             }
         }
         buckets
     });
-    let mut base = vec![0usize; nb + 1];
-    for b in 0..nb {
-        base[b + 1] = base[b] + parts.iter().map(|p| p[b].len()).sum::<usize>();
-    }
-    // Regroup by bucket, so each bucket's lists can be freed as soon as it is built.
-    let mut by_bucket: Vec<Vec<Vec<[u32; 3]>>> = (0..nb).map(|_| Vec::new()).collect();
-    for part in parts {
-        by_bucket
-            .iter_mut()
-            .zip(part)
-            .for_each(|(b, list)| b.push(list));
-    }
-    let by_bucket: Vec<Mutex<Vec<Vec<[u32; 3]>>>> = by_bucket.into_iter().map(Mutex::new).collect();
-
-    // Counting sort, one bucket at a time: its degree counts fit in L1, and each bucket owns
-    // a disjoint range of `off` and of `adj`, so no atomics are needed.
-    let mut off = vec![0u32; n + 1];
-    off[n] = base[nb] as u32;
-    let mut adj = zero_edges(base[nb]);
-    let (offp, adjp) = (SharedPtr(off.as_mut_ptr()), SharedPtr(adj.as_mut_ptr()));
-    let (next, big) = (AtomicUsize::new(0), Mutex::new(Vec::new()));
-    par_map(vec![(); threads], |()| {
-        let mut cursor = vec![0u32; 1 << SHIFT];
-        loop {
-            let b = next.fetch_add(1, Relaxed);
-            if b >= nb {
-                break;
-            }
-            let lists = std::mem::take(&mut *by_bucket[b].lock().unwrap());
-            let (lo, edges) = (b << SHIFT, || lists.iter().flatten());
-            cursor.fill(0);
-            edges().for_each(|&[u, _, _]| cursor[u as usize - lo] += 1);
-            let mut c = base[b] as u32;
-            for k in 0..(lo + (1 << SHIFT)).min(n) - lo {
-                offp.set(lo + k, c); // nodes lo.. belong to this bucket alone
-                (cursor[k], c) = (c, c + cursor[k]);
-            }
-            for &[u, v, w] in edges() {
-                adjp.set(cursor[u as usize - lo] as usize, edge(v, w)); // so do its edge slots
-                cursor[u as usize - lo] += 1;
-                if w >= u32::from(u16::MAX) {
-                    big.lock().unwrap().push((u, v, w));
-                }
-            }
-        }
-    });
+    let (off, adj) = place(
+        n,
+        parts,
+        threads,
+        |[u, _, _]| u as usize & 0xFFFF,
+        |[_, v, w]| edge(v, w),
+    );
     let mut big = big.into_inner().unwrap();
     big.sort_unstable();
     Graph { off, adj, big }
@@ -425,36 +445,35 @@ impl RadixHeap {
     }
 }
 
-/// The reverse graph: the in-edges of `v` as (tail, weight), for the backward search.
+/// The reverse graph: the in-edges of `v` as (tail, weight), for the backward search. Each
+/// thread sorts its own nodes' out-edges into buckets by head, as (tail, weight, head's low
+/// bits) in 8 bytes, and `place` lays them out: no atomics, unlike counting in-degrees
+/// with fetch_add, which twelve threads contend on.
 fn reverse(g: &Graph, threads: usize) -> Graph {
     let n = g.off.len() - 1;
-    let indeg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let nb = (n >> SHIFT) + 1;
     let ranges: Vec<_> = (0..threads)
         .map(|t| n * t / threads..n * (t + 1) / threads)
         .collect();
-    par_map(ranges.clone(), |r| {
-        for &Edge { v, .. } in &g.adj[g.off[r.start] as usize..g.off[r.end] as usize] {
-            indeg[v as usize].fetch_add(1, Relaxed);
-        }
-    });
-    let mut off = vec![0u32; n + 1];
-    for v in 0..n {
-        off[v + 1] = off[v] + indeg[v].load(Relaxed);
-        indeg[v].store(off[v], Relaxed); // now the write cursor of v
-    }
-    let mut adj = zero_edges(g.adj.len());
-    let dst = SharedPtr(adj.as_mut_ptr());
-    par_map(ranges, |r| {
+    let parts = par_map(ranges, |r| {
+        let expect = (g.off[r.end] - g.off[r.start]) as usize / nb;
+        let mut buckets: Vec<Vec<(u32, u16, u16)>> = (0..nb)
+            .map(|_| Vec::with_capacity(expect + expect / 4 + 16))
+            .collect();
         for u in r {
             for &Edge { v, w } in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
-                // fetch_add hands every in-edge its own slot
-                dst.set(
-                    indeg[v as usize].fetch_add(1, Relaxed) as usize,
-                    Edge { v: u as u32, w },
-                );
+                buckets[(v >> SHIFT) as usize].push((u as u32, w, v as u16));
             }
         }
+        buckets
     });
+    let (off, adj) = place(
+        n,
+        parts,
+        threads,
+        |(_, _, low)| usize::from(low),
+        |(u, w, _)| Edge { v: u, w },
+    );
     let mut big: Vec<_> = g.big.iter().map(|&(u, v, w)| (v, u, w)).collect();
     big.sort_unstable();
     Graph { off, adj, big }

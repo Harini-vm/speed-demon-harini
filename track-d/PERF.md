@@ -114,3 +114,9 @@ Board, step 8: M 106 to 91.5 MiB at the same time. The source grew by 63 lines, 
 During the renumbering's copy, the old graph, the new graph, `new_id` and the BFS `order` all existed together, and that is the run's peak. `order` is only needed to build `new_id`. The degrees and the copy now run over ranges of old ids, each node writing its list at its new offset, so `order` is freed first. Local cgroup at 12 threads: 88 to 85 MB, time within noise.
 
 Board, step 9: M went up, 91.5 to 95.9 MiB, against a 3 MB drop locally. The copy now writes each node's list at a random place in the new graph instead of in order, and the box backs memory with transparent huge pages, so the scattered first writes likely commit 2 MB pages early. Reverted to step 8.
+
+## Step 10: reverse graph without atomics
+
+Box profiling (a build that printed phase times and exited) showed the reverse graph build taking 33 ms of a 196 ms run at 12 threads: every edge did an atomic `fetch_add` on its head's counter, and the heads are spread across all threads, so the cache lines bounce between cores. The reverse graph is now built the same way as the forward graph: each thread puts its edges into buckets by head range, then each bucket is counted, prefix-summed and placed by one thread, with no shared counters. Both builds use one `place` helper. Local reverse phase: 53 to 16 ms at 2 threads; memory unchanged (85 MB at 12 threads).
+
+Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, with 1, 3 and 13 threads, and with a build without AVX2.
