@@ -13,7 +13,8 @@ Every step from the reference to the final version, each with the live-board run
 | 6 | Field ends from a 64-byte space/LF bitmask | `7c515ca` | 0.042 | 54 | 393 | 27.66 | 72.092 |
 | 7 | Fixed 128 KiB mmap threshold; cell table sized to the spec's 72 hours | `16b8be5` | 0.045 | 50 | 395 | 26.97 | 71.529 |
 | 8 | Transparent huge pages off for the process | `d08c379` | 0.045 | 38 | 397 | 28.29 | 72.583 |
-| 9 | Prefix-sum hours dealt to one share per thread | _fill in_ | | | | | |
+| 9 | Prefix-sum hours dealt to one share per thread | `d430b7c` | 0.044 | 36 | 404 | 28.93 | 73.071 |
+| 10 | Experiment: latencies read in a second pass instead of stored per line | _fill in_ | | | | | |
 
 ## Step 1
 
@@ -127,3 +128,9 @@ The prefix-sum step ran one `par_map` item per hour, which started 72 threads fo
 Tried: a persistent worker pool reused by every phase (no thread starts after the first). It was about 4 to 7% faster locally, but it added 75 lines, which costs about as much through S as it gains through T. Not kept.
 
 Correctness: identical SHA-256 to the reference on tiny seeds 1 to 12, sample seeds 1 to 7, full seeds 1 and 42, the worked example, an empty input, and with 1, 3, 13 and 100 threads.
+
+Board, step 9: 73.071. The same code measured 51 ms in the next push (`19aaf87`), against 44 ms here, so a single run can be off by 17%.
+
+## Step 10 (experiment): latencies stored once
+
+Each line kept its latency (4 bytes) until the scatter copied it into its group, so all 3.1 million latencies existed twice at the peak. Now the parse keeps only the endpoint id with the 5xx flag (2 bytes per line). The scatter walks each thread's text again with the same separator bitmask, reads just the latency field, and writes it straight to its group. Local cgroup at 12 threads: 34 to 25 MB. But it costs a second pass over the text: about 20% slower locally (2 threads). This is pushed to measure on the box, where memory and page faults weigh more than here. It is kept only if the board agrees.

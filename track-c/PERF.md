@@ -12,7 +12,8 @@ Every step from the reference to the final version, each with the live-board run
 | 5 | regions.csv parsed in parallel in one pass; name slots prefetched four records ahead | `7c515ca` | 0.067 | 47 | 444 | 17.90 | 62.638 |
 | 6 | Fixed 128 KiB mmap threshold; name bitmaps grown to the ids in use | `16b8be5` | 0.060 | 25 | 448 | 21.53 | 66.652 |
 | 7+8 | Huge pages off, name table committed in one call (one board run) | `d430b7c` | 0.066 | 25 | 457 | 20.35 | 65.510 |
-| 9 | Huge pages back on; the name table is still committed up front | _fill in_ | | | | | |
+| 9 | Huge pages back on; the name table is still committed up front | `19aaf87` | 0.088 | 25 | 455 | 16.94 | 62.417 |
+| 10 | Reverted to the code of step 6 | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -110,3 +111,5 @@ Local, 2 threads, three alternating rounds of 9: about 8 to 10% faster. The same
 Correctness: identical SHA-256 to the reference on tiny seeds 1 to 25, sample seeds 1 to 6, full seeds 1 and 13, the worked example, the edge-case files, and with 1, 3 and 13 threads.
 
 Board, huge pages off: the memory did not move here, and the time got worse. A re-run of Track B's unchanged code in the same push was 7% slower than its earlier run, so part of that is the box. The rest is what huge pages buy on large, randomly read arrays (fewer TLB misses). Turning them off helped only Track A, whose arrays are partly touched. They are back on for this track.
+
+Board, step 9: 60 to 88 ms. The same push ran Track A's and B's unchanged code 17% slower than before, so the box itself was slow in that run, but 46% is more than that. Committing 8 MB up front with huge pages on may make the kernel compact memory to find them. This track goes back to the code of step 6, the best measured. Lesson: one run per push swings by up to 17% here, so a change is kept only when it measures well more than once.

@@ -66,8 +66,9 @@ struct Parsed<'a> {
     names: Vec<&'a [u8]>,
     /// The same names, sorted bytewise (done here, in parallel, for the merge in main).
     sorted: Vec<&'a [u8]>,
-    /// Per line: the latency, and the endpoint id | 5xx << 15.
-    lats: Vec<u32>,
+    /// The thread's text: step 4 walks it again for the latencies.
+    text: &'a [u8],
+    /// Per line: the endpoint id | 5xx << 15.
     ids: Vec<u16>,
     /// (line index, hour) wherever the hour changes from the line before.
     hours: Vec<(u32, u32)>,
@@ -156,7 +157,6 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
     const SLOTS: usize = 1 << BITS; // > 4x the 1,842 endpoints, so probes stay short
     let mut table = vec![0u32; SLOTS]; // id + 1, 0 = empty
     let mut names: Vec<&[u8]> = Vec::with_capacity(2048);
-    let mut lats = Vec::with_capacity(buf.len() / 70);
     let mut ids = Vec::with_capacity(buf.len() / 70);
     let mut hours = Vec::new();
     let mut cells = vec![0u32; HOUR_CAP * EP_CAP];
@@ -186,7 +186,7 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
         // A line has exactly four spaces and an LF: after the timestamp, the method, the
         // endpoint and the status. Hash the endpoint's first and last eight bytes with its
         // length; the line goes on for at least 7 bytes after it, so the loads stay in bounds.
-        let [_, m, s, t, nl] = [0; 5].map(|_| seps.next());
+        let [_, m, s, _, nl] = [0; 5].map(|_| seps.next());
         let e = m + 1;
         let name = &buf[e..s];
         let len = s - e;
@@ -212,7 +212,6 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
         };
         // status: three digits; 5xx is an error. latency: digits up to LF.
         cells[hour * EP_CAP + id] += 1;
-        lats.push(latency(buf, t + 1, nl) as u32);
         ids.push(id as u16 | u16::from(buf[s + 1] == b'5') << 15);
         p = nl + 1;
     }
@@ -221,7 +220,7 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
     Parsed {
         names,
         sorted,
-        lats,
+        text: buf,
         ids,
         hours,
         cells,
@@ -399,15 +398,24 @@ fn main() {
         }
     });
 
-    // 4. Scatter latencies so every group is contiguous, and count 5xx lines per group (few
-    //    lines, so shared atomic counters cost little). Then free the per-line records.
+    // 4. Walk each thread's text again, taking only each line's latency (the field ends come
+    //    from the same separator bitmask), and scatter it so every group is contiguous: the
+    //    latencies are stored once, not once per line and again per group. Count 5xx lines
+    //    per group too (few lines, so shared atomic counters cost little).
     let mut lats = vec![0u32; total as usize];
     let errors: Vec<AtomicU32> = (0..n_groups).map(|_| AtomicU32::new(0)).collect();
     let dst = SharedPtr(lats.as_mut_ptr());
     let jobs: Vec<_> = parts.iter_mut().zip(&rank_of).collect();
     par_map(jobs, |(p, rank)| {
         let (mut hour, mut next) = (0, 0);
-        for (k, (&lat, &r)) in p.lats.iter().zip(&p.ids).enumerate() {
+        let mut seps = Seps {
+            buf: p.text,
+            at: 0,
+            mask: separators(p.text, 0),
+        };
+        for (k, &r) in p.ids.iter().enumerate() {
+            let [_, _, _, t, nl] = [0; 5].map(|_| seps.next());
+            let lat = latency(p.text, t + 1, nl) as u32;
             if next < p.hours.len() && p.hours[next].0 as usize == k {
                 hour = p.hours[next].1 as usize;
                 next += 1;
