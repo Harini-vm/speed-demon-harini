@@ -124,3 +124,13 @@ Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample se
 Board, step 10: T 196 to 189 ms, but M 91.5 to 107 MiB. Each thread's buckets were sized for edges spread evenly over the head ranges. After the renumbering a range's heads lie mostly near it, so a few buckets grew by doubling several times. Each thread now counts its buckets first and allocates them at their exact size.
 
 Board, exact sizes: M 106.6 MiB, T 188 ms. The extra memory is not the buckets' spare capacity: it is the 40 MB of buckets themselves, alive at the same time as the forward graph and the reverse graph being filled. That set the peak on the box, though not in a local cgroup. A 4% time gain does not pay for 16% more memory, so the reverse graph is built with atomic counters again, as in step 8.
+
+## Step 11: no reverse graph
+
+The backward search needs every node's in-edges, so the program built a second graph, the reverse, with an atomic counter per head (33 ms of 196 on the box, measured by a build that printed phase times and exited). But road segments are nearly all two-way: an in-edge y -> x is usually the reverse of an out-edge x -> y that x's list already holds. So instead of a second graph, each out-edge x -> y gets the weight of its reverse y -> x in a parallel u16 array, or "absent". The backward search reads x's own list and that array. The in-edges that are not reverses of an out-edge, 144,000 one-way streets out of 5 million edges, go in a short side list ordered by blocks of 64 heads, with one bit per head saying whether to look.
+
+Finding y -> x means scanning y's list for x. After the renumbering, y's list is near x's in memory, so the scan stays in cache. Each thread fills the array for its own range of x, with no atomics. Weights of 65,534 or more are now the side list's (`BIG`), so that 65,535 can mean "absent".
+
+The graph data for the queries goes from 74 MB (two graphs) to 47 MB (one graph and the array). Locally, at 2 threads: the queries take the same time, and building the array takes a little longer than the atomic reverse build did. On 12 threads it has no shared counters, unlike the reverse build.
+
+Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, and with 1, 3 and 13 threads in a build without AVX2.

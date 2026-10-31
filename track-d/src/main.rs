@@ -15,7 +15,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 use std::thread;
 
@@ -157,10 +157,15 @@ fn zero_edges(n: usize) -> Vec<Edge> {
     }
 }
 
+/// A stored weight of BIG stands for one of BIG or more, kept in the graph's `big` list.
+/// ABSENT marks a missing reverse edge in `Back::rw`.
+const BIG: u16 = u16::MAX - 1;
+const ABSENT: u16 = u16::MAX;
+
 fn edge(v: u32, w: u32) -> Edge {
     Edge {
         v,
-        w: w.min(u32::from(u16::MAX)) as u16,
+        w: w.min(u32::from(BIG)) as u16,
     }
 }
 
@@ -181,7 +186,7 @@ impl Graph {
             let (v, w) = (e.v, e.w);
             (
                 v,
-                if w != u16::MAX {
+                if w != BIG {
                     u64::from(w)
                 } else {
                     self.big_weight(u, v)
@@ -190,7 +195,7 @@ impl Graph {
         })
     }
 
-    /// A stored weight of 65,535 from `u` to `v`: the smallest such edge's real weight
+    /// A stored weight of BIG from `u` to `v`: the smallest such edge's real weight
     /// (parallel edges may share the pair; any of their weights is a real edge).
     #[cold]
     fn big_weight(&self, u: u32, v: u32) -> u64 {
@@ -271,7 +276,7 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
             for &[u, v, w] in edges() {
                 adjp.set(cursor[u as usize - lo] as usize, edge(v, w)); // so do its edge slots
                 cursor[u as usize - lo] += 1;
-                if w >= u32::from(u16::MAX) {
+                if w >= u32::from(BIG) {
                     big.lock().unwrap().push((u, v, w));
                 }
             }
@@ -425,39 +430,100 @@ impl RadixHeap {
     }
 }
 
-/// The reverse graph: the in-edges of `v` as (tail, weight), for the backward search.
-fn reverse(g: &Graph, threads: usize) -> Graph {
-    let n = g.off.len() - 1;
-    let indeg: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-    let ranges: Vec<_> = (0..threads)
-        .map(|t| n * t / threads..n * (t + 1) / threads)
-        .collect();
-    par_map(ranges.clone(), |r| {
-        for &Edge { v, .. } in &g.adj[g.off[r.start] as usize..g.off[r.end] as usize] {
-            indeg[v as usize].fetch_add(1, Relaxed);
-        }
-    });
-    let mut off = vec![0u32; n + 1];
-    for v in 0..n {
-        off[v + 1] = off[v] + indeg[v].load(Relaxed);
-        indeg[v].store(off[v], Relaxed); // now the write cursor of v
+/// The edges a search follows from `u`, as (other end, weight), passed to `f`.
+trait Adj {
+    fn each(&self, u: u32, f: impl FnMut(u32, u64));
+}
+
+impl Adj for Graph {
+    #[inline(always)]
+    fn each(&self, u: u32, mut f: impl FnMut(u32, u64)) {
+        self.edges(u).for_each(|(v, w)| f(v, w));
     }
-    let mut adj = zero_edges(g.adj.len());
-    let dst = SharedPtr(adj.as_mut_ptr());
-    par_map(ranges, |r| {
-        for u in r {
-            for &Edge { v, w } in &g.adj[g.off[u] as usize..g.off[u + 1] as usize] {
-                // fetch_add hands every in-edge its own slot
-                dst.set(
-                    indeg[v as usize].fetch_add(1, Relaxed) as usize,
-                    Edge { v: u as u32, w },
-                );
+}
+
+/// The in-edges of every node, for the backward search, without a second graph. Road
+/// segments are nearly all two-way, so in-edge y -> x is usually the reverse of an
+/// out-edge x -> y: `rw[j]` holds the weight of the reverse of edge `j` (the lightest one
+/// if parallel), or ABSENT. The few others (one-way streets) are in `extra` as sorted
+/// (head, tail, weight), flagged per head in `has_extra`.
+struct Back<'a> {
+    g: &'a Graph,
+    rw: Vec<u16>,
+    extra: Vec<(u32, u32, u32)>,
+    has_extra: Vec<u64>,
+    start: Vec<u32>, // extra[start[b]..start[b + 1]] holds the heads in block b of 64 nodes
+}
+
+impl<'a> Back<'a> {
+    /// After the renumbering, y's list is near x's in memory, so finding x in it is cheap.
+    fn new(g: &'a Graph, threads: usize) -> Self {
+        let n = g.off.len() - 1;
+        let mut rw = vec![0u16; g.adj.len()];
+        let dst = SharedPtr(rw.as_mut_ptr());
+        let ranges: Vec<_> = (0..threads)
+            .map(|t| n * t / threads..n * (t + 1) / threads)
+            .collect();
+        let found = par_map(ranges, |r| {
+            let mut extra = Vec::new();
+            for x in r {
+                for j in g.off[x] as usize..g.off[x + 1] as usize {
+                    let Edge { v: y, w } = g.adj[j];
+                    let back = &g.adj[g.off[y as usize] as usize..g.off[y as usize + 1] as usize];
+                    let mut rev = ABSENT; // BIG < ABSENT, so the min is the lightest reverse
+                    back.iter().for_each(|e| rev = if e.v == x as u32 { rev.min(e.w) } else { rev });
+                    dst.set(j, rev); // edge j is in this thread's range
+                    if rev == ABSENT {
+                        let w = if w != BIG { u64::from(w) } else { g.big_weight(x as u32, y) };
+                        extra.push((y, x as u32, w as u32));
+                    }
+                }
+            }
+            extra
+        });
+        // Counting sort by block of 64 heads; a lookup scans its block's few entries.
+        let (mut has_extra, mut start) = (vec![0u64; n / 64 + 1], vec![0u32; n / 64 + 2]);
+        for &(y, _, _) in found.iter().flatten() {
+            has_extra[y as usize / 64] |= 1 << (y % 64);
+            start[y as usize / 64 + 1] += 1;
+        }
+        (0..start.len() - 1).for_each(|b| start[b + 1] += start[b]);
+        let mut cursor = start.clone();
+        let mut extra = vec![(0, 0, 0); start[n / 64 + 1] as usize];
+        for &e in found.iter().flatten() {
+            extra[cursor[e.0 as usize / 64] as usize] = e;
+            cursor[e.0 as usize / 64] += 1;
+        }
+        Back { g, rw, extra, has_extra, start }
+    }
+
+    fn has_in(&self, x: u32) -> bool {
+        let mut any = false;
+        self.each(x, |_, _| any = true);
+        any
+    }
+}
+
+impl Adj for Back<'_> {
+    #[inline(always)]
+    fn each(&self, x: u32, mut f: impl FnMut(u32, u64)) {
+        let g = self.g;
+        let (a, b) = (g.off[x as usize] as usize, g.off[x as usize + 1] as usize);
+        for (e, &rw) in g.adj[a..b].iter().zip(&self.rw[a..b]) {
+            if rw != ABSENT {
+                let y = e.v;
+                f(y, if rw != BIG { u64::from(rw) } else { g.big_weight(y, x) });
             }
         }
-    });
-    let mut big: Vec<_> = g.big.iter().map(|&(u, v, w)| (v, u, w)).collect();
-    big.sort_unstable();
-    Graph { off, adj, big }
+        if self.has_extra[x as usize / 64] >> (x % 64) & 1 != 0 {
+            let b = x as usize / 64;
+            for &(h, y, w) in &self.extra[self.start[b] as usize..self.start[b + 1] as usize] {
+                if h == x {
+                    f(y, u64::from(w));
+                }
+            }
+        }
+    }
 }
 
 /// Node v's distance lives on page `v >> PAGE_BITS` of a small pool, so a search uses
@@ -531,17 +597,17 @@ impl Side {
 
     /// Settles one node and relaxes its edges in `g`. Every relaxed edge that reaches a
     /// node the other side has labelled is a complete s-t path; `best` keeps the shortest.
-    fn step(&mut self, g: &Graph, other: &Side, best: &mut u64, wide: &mut bool) {
+    fn step(&mut self, g: &impl Adj, other: &Side, best: &mut u64, wide: &mut bool) {
         let (d, u) = self.heap.pop().unwrap();
         let d = u64::from(d);
         if d + 1 > u64::from(self.dist(u)) {
             return; // stale entry
         }
-        for (v, w) in g.edges(u) {
+        g.each(u, |v, w| {
             let nd = d + w;
             if nd >= u64::from(u32::MAX) {
                 *wide = true;
-                continue;
+                return;
             }
             let o = other.dist(v);
             if o != 0 {
@@ -556,7 +622,7 @@ impl Side {
                 }
                 self.heap.push(nd as u32, v);
             }
-        }
+        });
     }
 }
 
@@ -567,7 +633,7 @@ impl Side {
 /// Returns None if a distance left u32, else Some(the distance, or None if unreachable).
 fn shortest(
     g: &Graph,
-    r: &Graph,
+    r: &Back,
     (f, b): &mut (Side, Side),
     s: u32,
     t: u32,
@@ -635,7 +701,7 @@ fn main() {
         queries.push((s, new_id[number(qtext, &mut i) as usize]));
     }
     drop(new_id);
-    let rev = reverse(&g, threads);
+    let rev = Back::new(&g, threads);
 
     // Queries sorted by source and handed out four at a time: the threads then all work in
     // one moving part of the renumbered map, which the shared cache holds, and short runs
@@ -645,7 +711,6 @@ fn main() {
     let runs: Vec<&[usize]> = by_source.chunks(4).collect();
     let answers: Vec<AtomicI64> = queries.iter().map(|_| AtomicI64::new(-1)).collect();
     let (next, n) = (AtomicUsize::new(0), g.off.len() - 1);
-    let no_edges = |g: &Graph, x: usize| g.off[x] == g.off[x + 1];
     par_map(vec![(); threads], |()| {
         let mut sides: Option<(Side, Side)> = None;
         while let Some(run) = runs.get(next.fetch_add(1, Relaxed)) {
@@ -653,7 +718,7 @@ fn main() {
                 let (s, t) = queries[q];
                 let answer = if s == t {
                     Some(0)
-                } else if no_edges(&g, s as usize) || no_edges(&rev, t as usize) {
+                } else if g.off[s as usize] == g.off[s as usize + 1] || !rev.has_in(t) {
                     None // no way out of s, or no way into t
                 } else {
                     let sides = sides.get_or_insert_with(|| (Side::new(n), Side::new(n)));
