@@ -9,7 +9,8 @@ Every step from the reference to the final version, each with the live-board run
 | 2 | Branch-free parsing; counts kept per thread during the parse | `155b431` | 0.047 | 55 | 353 | 26.43 | 71.109 |
 | 3 | The serial steps between phases made parallel | `5c2e2da` | 0.043 | 54 | 407 | 27.06 | 71.618 |
 | 4 | Smaller source: the same logic in fewer lines | (shipped with step 5) | | | | | |
-| 5 | 6 bytes per line instead of 8, u32 cell counts, linear merge of endpoint names | _fill in_ | | | | | |
+| 5 | 6 bytes per line instead of 8, u32 cell counts, linear merge of endpoint names | (shipped with step 6) | | | | | |
+| 6 | Field ends from a 64-byte space/LF bitmask | _fill in_ | | | | | |
 
 ## Step 1
 
@@ -84,3 +85,17 @@ The endpoint ranks also changed. The threads' sorted name lists are nearly ident
 Peak at 12 threads, cgroup: 50 MB to 45 MB. Local time (2 threads, phase minima over 9 runs): 120 ms to 104 ms, which is within noise.
 
 371 code lines. Correctness: identical SHA-256 to the reference on tiny seeds 1 to 12, sample seeds 1 to 7, full seeds 1 and 42, the worked example, an empty input, and with 1, 3, 7 and 13 threads.
+
+## Step 6: parse
+
+A model fits the board: the box's time is about the total CPU time measured here × 0.18, plus a few ms. That is the 2-core machine's CPU time, scaled for 6 P-cores and 12 threads at 2.5 GHz with no turbo. Parsing is about 60% of that CPU time, so it is still the target.
+
+- **Separator bitmask.** A line has exactly four spaces and an LF. Each thread now builds a 64-bit mask of spaces and LFs per 64 bytes (two AVX2 compares and a movemask per half) and takes field ends with trailing-zero counts. This replaces the per-field searches: a word for the method's space, a 32-byte loop for the endpoint's end, two words for the LF. Their exits depended on the data. Parse phase, 2 threads, min of 9 runs: 67 to 57 ms in two alternating rounds.
+
+Tried and measured:
+
+- **Endpoint lookup.** Replacing the lookup with a fake id (wrong output, timing only) took the parse to 45 ms, so the lookup costs about 12 ms. Neither of two alternatives helped. One kept the endpoint's first and last words and length in each slot, so endpoints up to 16 bytes are checked without touching the name (60 to 65 ms). The other compared word by word inline instead of calling memcmp (69 to 70 ms). Both were reverted.
+- **Two-digit itoa table for the output.** Pct phase unchanged (20 ms), reverted.
+- **MAP_POPULATE on the input.** Moves about 4 ms of page faults from the parse into a single-threaded mmap, so no gain.
+
+384 code lines. Correctness: identical SHA-256 to the reference on tiny seeds 1 to 12, sample seeds 1 to 7, full seeds 1 and 42, the worked example, an empty input, with 1, 3, 7 and 13 threads, and with a build without AVX2.

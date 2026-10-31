@@ -80,46 +80,53 @@ fn word(buf: &[u8], i: usize) -> u64 {
 
 const ONES: u64 = 0x0101_0101_0101_0101;
 
-/// SWAR: the byte index of the first `b` in `w` (lowest address first), or 8 if none.
-/// The zero-byte test can flag a false byte only above a real one, so the lowest is exact.
+/// Spaces and LFs of 64 bytes from `at` as a bitmask (bit k = byte at + k). Past the end
+/// of `buf` the bytes read as zero.
 #[inline(always)]
-fn first_in_word(w: u64, b: u8) -> usize {
-    let x = w ^ (ONES * u64::from(b));
-    ((x.wrapping_sub(ONES) & !x & (ONES << 7)).trailing_zeros() / 8) as usize
-}
-
-/// Index of the first space at or after `i`: 32 bytes per step with AVX2.
-#[inline(always)]
-fn find_space(buf: &[u8], mut i: usize) -> usize {
+fn separators(buf: &[u8], at: usize) -> u64 {
+    if at + 64 > buf.len() {
+        let mut pad = [0u8; 64];
+        pad[..buf.len() - at].copy_from_slice(&buf[at..]);
+        return separators(&pad, 0);
+    }
     #[cfg(target_feature = "avx2")]
-    while i + 32 <= buf.len() {
+    {
         use std::arch::x86_64::*;
-        // SAFETY: AVX2 is enabled at compile time and the 32 bytes are inside `buf`.
-        let m = unsafe {
-            let v = _mm256_loadu_si256(buf.as_ptr().add(i).cast());
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b' ' as i8))) as u32
-        };
-        if m != 0 {
-            return i + m.trailing_zeros() as usize;
+        // SAFETY: AVX2 is enabled at compile time and the 64 bytes are inside `buf`.
+        unsafe {
+            let half = |k: usize| {
+                let v = _mm256_loadu_si256(buf.as_ptr().add(at + k).cast());
+                let sp = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b' ' as i8));
+                let lf = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8));
+                u64::from(_mm256_movemask_epi8(_mm256_or_si256(sp, lf)) as u32)
+            };
+            half(0) | half(32) << 32
         }
-        i += 32;
     }
-    i + buf[i..].iter().position(|&c| c == b' ').unwrap() // the last bytes, or no AVX2
+    #[cfg(not(target_feature = "avx2"))]
+    (0..64).fold(0, |m, k| {
+        m | u64::from(matches!(buf[at + k], b' ' | b'\n')) << k
+    })
 }
 
-/// The index of the LF that ends the latency starting at `q`.
-#[inline(always)]
-fn line_end(buf: &[u8], q: usize) -> usize {
-    if q + 16 > buf.len() {
-        // The last line of a chunk: too close to the end for word loads.
-        return q + buf[q..].iter().position(|&c| c == b'\n').unwrap();
-    }
-    // At most 10 digits, so the LF is in one of the next two words.
-    let k = first_in_word(word(buf, q), b'\n');
-    if k < 8 {
-        q + k
-    } else {
-        q + 8 + first_in_word(word(buf, q + 8), b'\n')
+/// Walks the spaces and LFs of a buffer in order, 64 bytes of bitmask at a time, so
+/// finding a field's end costs a trailing-zero count instead of a byte loop.
+struct Seps<'a> {
+    buf: &'a [u8],
+    at: usize,
+    mask: u64,
+}
+
+impl Seps<'_> {
+    #[inline(always)]
+    fn next(&mut self) -> usize {
+        while self.mask == 0 {
+            self.at += 64;
+            self.mask = separators(self.buf, self.at);
+        }
+        let i = self.at + self.mask.trailing_zeros() as usize;
+        self.mask &= self.mask - 1;
+        i
     }
 }
 
@@ -152,6 +159,11 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
     let mut cells = vec![0u32; HOUR_CAP * EP_CAP];
     let mut max_hour = 0;
     let (mut prev, mut hour) = ((u64::MAX, u64::MAX), 0);
+    let mut seps = Seps {
+        buf,
+        at: 0,
+        mask: separators(buf, 0),
+    };
     let mut p = 0;
     while p < buf.len() {
         // ts is fixed width: YYYY-MM-DDTHH:MM:SS.ffffffZ. Neighbouring lines nearly always
@@ -168,11 +180,11 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
                 hours.push((ids.len() as u32, hour as u32));
             }
         }
-        // method: 3 to 7 letters, so its space is inside the word at p + 28
-        let e = p + 29 + first_in_word(word(buf, p + 28), b' ');
-        // endpoint: find its end, then hash its first and last eight bytes with its length.
-        // The line goes on for at least 7 bytes after it, so the 8-byte loads stay in bounds.
-        let s = find_space(buf, e);
+        // A line has exactly four spaces and an LF: after the timestamp, the method, the
+        // endpoint and the status. Hash the endpoint's first and last eight bytes with its
+        // length; the line goes on for at least 7 bytes after it, so the loads stay in bounds.
+        let [_, m, s, t, nl] = [0; 5].map(|_| seps.next());
+        let e = m + 1;
         let name = &buf[e..s];
         let len = s - e;
         let first = if len < 8 {
@@ -196,9 +208,8 @@ fn parse(buf: &[u8], base_hour: i64) -> Parsed<'_> {
             }
         };
         // status: three digits; 5xx is an error. latency: digits up to LF.
-        let nl = line_end(buf, s + 5);
         cells[hour * EP_CAP + id] += 1;
-        lats.push(latency(buf, s + 5, nl) as u32);
+        lats.push(latency(buf, t + 1, nl) as u32);
         ids.push(id as u16 | u16::from(buf[s + 1] == b'5') << 15);
         p = nl + 1;
     }
