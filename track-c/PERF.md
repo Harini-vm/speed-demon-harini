@@ -16,7 +16,8 @@ Every step from the reference to the final version, each with the live-board run
 | 10 | Reverted to the code of step 6 | `95c27fb` | 0.067 | 24 | 448 | 20.31 | 65.531 |
 | 11 | Name table of 2^17 slots instead of 2^18 | `81d8989` | 0.061 | 20 | 448 | 21.83 | 67.407 |
 | 12 | Ids, region ids and amounts converted eight digits at a time | `8c8a2a2` | 0.062 | 20 | 462 | 21.39 | 67.107 |
-| 13 | Experiment: the input mapped with MAP_POPULATE | _fill in_ | | | | | |
+| 13 | Experiment: the input mapped with MAP_POPULATE | `a4c82ac` | 0.069 | 20 | 469 | 18.98 | 65.720 |
+| 14 | Reverted to step 12 | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -136,3 +137,5 @@ Board, step 12: 62 ms, within one run's noise of 60, so the box did not show the
 ## Step 13 (experiment)
 
 The input is mapped with `MAP_POPULATE`, so the kernel maps every page in the `mmap` call, in one thread, before the parse starts. No memory is added: the pages are the page cache's, mapped read-only.
+
+Board, step 13: 69 ms, slower, with the other tracks' runs normal in the same push. Mapping 200 MB in one thread costs more than the threads' own faults did, so page faults on the input are not this track's bottleneck. Reverted.

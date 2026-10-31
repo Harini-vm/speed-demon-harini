@@ -29,10 +29,9 @@ fn map(path: &str) -> &'static [u8] {
         return &[];
     }
     // SAFETY: a read-only private mapping (PROT_READ = 1, MAP_PRIVATE = 2) of a file nobody
-    // modifies while we run. It stays mapped until the process exits. MAP_POPULATE (0x8000)
-    // maps every page now, in one call, instead of twelve threads faulting them in at once.
+    // modifies while we run. It stays mapped until the process exits.
     unsafe {
-        let ptr = mmap(std::ptr::null_mut(), len, 1, 2 | 0x8000, file.as_raw_fd(), 0);
+        let ptr = mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0);
         assert!(ptr as isize != -1, "mmap {path} failed");
         std::slice::from_raw_parts(ptr, len)
     }
