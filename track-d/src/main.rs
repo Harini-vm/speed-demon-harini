@@ -776,7 +776,7 @@ fn main() {
     let runs: Vec<&[usize]> = by_source.chunks(4).collect();
     let answers: Vec<AtomicI64> = queries.iter().map(|_| AtomicI64::new(-1)).collect();
     let (next, n) = (AtomicUsize::new(0), g.off.len() - 1);
-    par_map(vec![(); threads], |()| {
+    par_map(vec![(); threads.div_ceil(2)], |()| {
         let mut sides: Option<(Side, Side)> = None;
         while let Some(run) = runs.get(next.fetch_add(1, Relaxed)) {
             for &q in *run {
