@@ -60,39 +60,42 @@ fn word(buf: &[u8], i: usize) -> u64 {
     u64::from_le_bytes(buf[i..i + 8].try_into().unwrap())
 }
 
-/// SWAR: the index of the first byte of `w` below `n` (a space or LF for n = b'0'), or 8.
-/// The borrow can flag a false byte only above a real one, so the lowest flag is exact.
+/// Bit k is set if `buf[at + k]` is a space or LF, the only bytes below `0`; 0 past the end.
 #[inline(always)]
-fn first_below(w: u64, n: u8) -> usize {
-    ((w.wrapping_sub(ONES * u64::from(n)) & !w & (ONES << 7)).trailing_zeros() / 8) as usize
+fn seps(buf: &[u8], at: usize) -> u64 {
+    #[cfg(target_feature = "avx2")]
+    if at + 64 <= buf.len() {
+        use std::arch::x86_64::*;
+        // SAFETY: AVX2 is enabled at compile time and the 64 bytes are inside `buf`. Input
+        // bytes are ASCII, so the signed compare is an unsigned one.
+        return unsafe {
+            let zero = _mm256_set1_epi8(b'0' as i8);
+            let half = |o: usize| {
+                let v = _mm256_loadu_si256(buf.as_ptr().add(at + o).cast());
+                u64::from(_mm256_movemask_epi8(_mm256_cmpgt_epi8(zero, v)) as u32)
+            };
+            half(0) | half(32) << 32
+        };
+    }
+    // The last block of a chunk, or a build without AVX2.
+    buf[at..].iter().take(64).enumerate().fold(0, |m, (k, &c)| m | u64::from(c < b'0') << k)
 }
 
-/// `number` without a loop per digit: the separator is found a word at a time, and the
-/// last (up to) eight digits are converted at once, as one word ending at the separator
-/// with the bytes before the number masked to zero digits (pairs, quads, then octets).
+/// The decimal `buf[start..end]`: the last (up to) eight digits converted at once, as one
+/// word ending at `end` with the bytes before the number masked to zero digits (pairs,
+/// quads, then octets), and any digits before those one at a time.
 #[inline(always)]
-fn number_fast(buf: &[u8], i: &mut usize) -> u64 {
-    let q = *i;
-    if q < 8 || q + 16 > buf.len() {
-        return number(buf, i); // too close to either end for the word loads
+fn decimal(buf: &[u8], start: usize, end: usize) -> u64 {
+    let digits = |b: &[u8]| b.iter().fold(0, |a, &c| a * 10 + u64::from(c - b'0'));
+    if end < 8 {
+        return digits(&buf[start..end]); // too close to the start for the word load
     }
-    let k = first_below(word(buf, q), b'0');
-    let end = if k < 8 {
-        q + k
-    } else {
-        q + 8 + first_below(word(buf, q + 8), b'0')
-    };
-    let keep = (end - q).min(8);
+    let keep = (end - start).min(8);
     let mask = u64::MAX << (8 * (8 - keep));
     let d = (word(buf, end - 8) & mask) - (ONES * u64::from(b'0') & mask);
     let v = (d * 10 + (d >> 8)) & 0x00FF_00FF_00FF_00FF;
     let v = (v * 100 + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
-    let low = (v * 10_000 + (v >> 32)) & 0xFFFF_FFFF;
-    let high = buf[q..end - keep]
-        .iter()
-        .fold(0, |a, &c| a * 10 + u64::from(c - b'0'));
-    *i = end + 1;
-    high * 100_000_000 + low
+    digits(&buf[start..end - keep]) * 100_000_000 + ((v * 10_000 + (v >> 32)) & 0xFFFF_FFFF)
 }
 
 /// Splits `buf` into `n` pieces that each end just after a newline.
@@ -235,14 +238,22 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
         let mut buckets: Vec<Vec<[u32; 2]>> = (0..nb)
             .map(|_| Vec::with_capacity(expect + expect / 4 + 16))
             .collect();
-        let mut j = 0;
-        while j < chunk.len() {
-            let [u, v, w] = [0; 3].map(|_| number_fast(chunk, &mut j) as u32);
-            if u != v {
-                let e = edge(v, w);
-                buckets[(u >> SHIFT) as usize].push([u & 0xFFFF | u32::from(e.w) << 16, v]);
-                if e.w == BIG {
-                    big.lock().unwrap().push((u, v, w)); // about 50 edges at full scale
+        // Every number ends at a separator; a line's three are u, v and w.
+        let (mut start, mut field, mut x) = (0, 0, [0u32; 3]);
+        for at in (0..chunk.len()).step_by(64) {
+            let mut m = seps(chunk, at);
+            while m != 0 {
+                let end = at + m.trailing_zeros() as usize;
+                m &= m - 1;
+                x[field] = decimal(chunk, start, end) as u32;
+                (start, field) = (end + 1, if field == 2 { 0 } else { field + 1 });
+                let [u, v, w] = x;
+                if field == 0 && u != v {
+                    let e = edge(v, w);
+                    buckets[(u >> SHIFT) as usize].push([u & 0xFFFF | u32::from(e.w) << 16, v]);
+                    if e.w == BIG {
+                        big.lock().unwrap().push((u, v, w)); // about 50 edges at full scale
+                    }
                 }
             }
         }
@@ -745,26 +756,29 @@ fn main() {
     let g = relabel(graph, &mut queries, threads);
     let rev = Back::new(&g, threads);
 
-    // Queries sorted by source and handed out one at a time: the threads then all work in
-    // one moving part of the renumbered map, which the shared cache holds, and no thread is
-    // left finishing a run of long searches alone. Answers: i64, -1 unreachable.
+    // Queries sorted by source and handed out four at a time: the threads then all work in
+    // one moving part of the renumbered map, which the shared cache holds, and short runs
+    // keep a few long searches from leaving one thread last. Answers: i64, -1 unreachable.
     let mut by_source: Vec<usize> = (0..queries.len()).collect();
     by_source.sort_unstable_by_key(|&q| queries[q].0);
+    let runs: Vec<&[usize]> = by_source.chunks(4).collect();
     let answers: Vec<AtomicI64> = queries.iter().map(|_| AtomicI64::new(-1)).collect();
     let (next, n) = (AtomicUsize::new(0), g.off.len() - 1);
     par_map(vec![(); threads], |()| {
         let mut sides: Option<(Side, Side)> = None;
-        while let Some(&q) = by_source.get(next.fetch_add(1, Relaxed)) {
-            let (s, t) = queries[q];
-            let answer = if s == t {
-                Some(0)
-            } else if g.off[s as usize] == g.off[s as usize + 1] || !rev.has_in(t) {
-                None // no way out of s, or no way into t
-            } else {
-                let sides = sides.get_or_insert_with(|| (Side::new(n), Side::new(n)));
-                shortest(&g, &rev, sides, s, t).unwrap_or_else(|| shortest_wide(&g, s, t))
-            };
-            answers[q].store(answer.map_or(-1, |d| d as i64), Relaxed);
+        while let Some(run) = runs.get(next.fetch_add(1, Relaxed)) {
+            for &q in *run {
+                let (s, t) = queries[q];
+                let answer = if s == t {
+                    Some(0)
+                } else if g.off[s as usize] == g.off[s as usize + 1] || !rev.has_in(t) {
+                    None // no way out of s, or no way into t
+                } else {
+                    let sides = sides.get_or_insert_with(|| (Side::new(n), Side::new(n)));
+                    shortest(&g, &rev, sides, s, t).unwrap_or_else(|| shortest_wide(&g, s, t))
+                };
+                answers[q].store(answer.map_or(-1, |d| d as i64), Relaxed);
+            }
         }
     });
 
