@@ -12,7 +12,8 @@ Every step from the reference to the final version, each with the live-board run
 | 5 | 6 bytes per line instead of 8, u32 cell counts, linear merge of endpoint names | (shipped with step 6) | | | | | |
 | 6 | Field ends from a 64-byte space/LF bitmask | `7c515ca` | 0.042 | 54 | 393 | 27.66 | 72.092 |
 | 7 | Fixed 128 KiB mmap threshold; cell table sized to the spec's 72 hours | `16b8be5` | 0.045 | 50 | 395 | 26.97 | 71.529 |
-| 8 | Experiment: transparent huge pages off for the process | _fill in_ | | | | | |
+| 8 | Transparent huge pages off for the process | `d08c379` | 0.045 | 38 | 397 | 28.29 | 72.583 |
+| 9 | Prefix-sum hours dealt to one share per thread | _fill in_ | | | | | |
 
 ## Step 1
 
@@ -116,3 +117,13 @@ Local cgroup peak at 12 threads: 45 MB to 34 MB. Time unchanged (min of 9, alter
 Board, step 7: M 54 to 50 MB (47.5 MiB) and T 42 to 45 ms. That is one run per push, so the time is within noise of step 6.
 
 After step 7, Tracks B, C and D measure within 4 to 8 MB of a local memory cgroup, but A is still about 16 MB above it (34 MB locally). The top teams' 16 to 20 MB on this track also shows that the box does not charge the 10 MB output to them in a way that adds up. So something in A's run, and only on the box, holds about 16 MB more. Transparent huge pages could do it: one 2 MB page commits all its memory on the first write. This step turns them off for the process with `prctl(PR_SET_THP_DISABLE)` and changes nothing else, so the next board run says whether they were the cause.
+
+Board, step 8: M 50 to 38 MB with T unchanged, which confirms the box backs memory with transparent huge pages. With them off, the board's number is within 4 MB of the local cgroup's.
+
+## Step 9: fewer thread starts
+
+The prefix-sum step ran one `par_map` item per hour, which started 72 threads for 72 small jobs. With all parallel phases counted, a run started 132 threads; 84 empty thread starts and joins take about 2.3 ms here. The hours are now dealt round-robin into one share per thread, so a run starts 72 threads. Local, 2 threads, three alternating rounds of 9: about 5% faster.
+
+Tried: a persistent worker pool reused by every phase (no thread starts after the first). It was about 4 to 7% faster locally, but it added 75 lines, which costs about as much through S as it gains through T. Not kept.
+
+Correctness: identical SHA-256 to the reference on tiny seeds 1 to 12, sample seeds 1 to 7, full seeds 1 and 42, the worked example, an empty input, and with 1, 3, 13 and 100 threads.

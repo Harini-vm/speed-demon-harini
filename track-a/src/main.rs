@@ -376,16 +376,24 @@ fn main() {
         .map(|p| SharedPtr(p.cells.as_mut_ptr()))
         .collect();
     let hours: Vec<_> = start[..n_groups].chunks_mut(n_eps).enumerate().collect();
-    par_map(hours, |(h, starts)| {
-        let mut total = hour_start[h];
-        for r in 0..n_eps {
-            starts[r] = total as u32;
-            for (cell, local) in cells.iter().zip(&local_of).filter(|(_, l)| l[r] != NONE) {
-                // SAFETY: cell (h, local id) is touched only by the worker for hour h.
-                let c = unsafe { &mut *cell.at(h * EP_CAP + local[r]) };
-                if *c != 0 {
-                    // (A zero cell is skipped: writing it would commit an untouched page.)
-                    (*c, total) = (total as u32, total + u64::from(*c));
+    // Hours dealt out round-robin, one thread per share instead of one per hour.
+    let k = threads.min(n_hours).max(1);
+    let mut shares: Vec<Vec<_>> = (0..k).map(|_| Vec::new()).collect();
+    for (i, x) in hours.into_iter().enumerate() {
+        shares[i % k].push(x);
+    }
+    par_map(shares, |share| {
+        for (h, starts) in share {
+            let mut total = hour_start[h];
+            for r in 0..n_eps {
+                starts[r] = total as u32;
+                for (cell, local) in cells.iter().zip(&local_of).filter(|(_, l)| l[r] != NONE) {
+                    // SAFETY: cell (h, local id) is touched only by the worker for hour h.
+                    let c = unsafe { &mut *cell.at(h * EP_CAP + local[r]) };
+                    if *c != 0 {
+                        // (A zero cell is skipped: writing it would commit an untouched page.)
+                        (*c, total) = (total as u32, total + u64::from(*c));
+                    }
                 }
             }
         }
