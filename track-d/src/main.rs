@@ -479,6 +479,8 @@ trait Adj {
     fn each(&self, u: u32, f: impl FnMut(u32, u64));
     /// Starts loading what `each(u)` will read.
     fn hint(&self, u: u32);
+    /// Starts loading where `u`'s edges are.
+    fn hint_off(&self, u: u32);
 }
 
 /// An edge of the query graph, 8 bytes: head, weight, and the weight of the reverse edge
@@ -565,6 +567,11 @@ impl Adj for Fwd<'_> {
     }
 
     #[inline(always)]
+    fn hint_off(&self, u: u32) {
+        self.0.hint_off(u);
+    }
+
+    #[inline(always)]
     fn each(&self, x: u32, mut f: impl FnMut(u32, u64)) {
         for e in self.0.list(x) {
             f(e.v, self.0.g.weight(e.w, x, e.v));
@@ -577,6 +584,11 @@ impl Adj for Back {
     #[inline(always)]
     fn hint(&self, u: u32) {
         prefetch(self.adj.as_ptr().wrapping_add(self.g.off[u as usize] as usize));
+    }
+
+    #[inline(always)]
+    fn hint_off(&self, u: u32) {
+        prefetch(&self.g.off[u as usize]);
     }
 
     #[inline(always)]
@@ -667,8 +679,12 @@ impl Side {
         // The next node to settle is usually already known, or else close to the lowest
         // bucket's last entry: start loading its edges.
         let h = &self.heap;
-        if let Some(&(_, next)) = h.buckets[h.full.trailing_zeros().min(32) as usize].last() {
+        let b = &h.buckets[h.full.trailing_zeros().min(32) as usize];
+        if let Some(&(_, next)) = b.last() {
             g.hint(next);
+        }
+        if let Some(&(_, after)) = b.len().checked_sub(2).map(|i| &b[i]) {
+            g.hint_off(after);
         }
         let d = u64::from(d);
         if d + 1 > u64::from(self.dist(u)) {
@@ -776,7 +792,7 @@ fn main() {
     let runs: Vec<&[usize]> = by_source.chunks(4).collect();
     let answers: Vec<AtomicI64> = queries.iter().map(|_| AtomicI64::new(-1)).collect();
     let (next, n) = (AtomicUsize::new(0), g.off.len() - 1);
-    par_map(vec![(); threads.div_ceil(2)], |()| {
+    par_map(vec![(); threads], |()| {
         let mut sides: Option<(Side, Side)> = None;
         while let Some(run) = runs.get(next.fetch_add(1, Relaxed)) {
             for &q in *run {
