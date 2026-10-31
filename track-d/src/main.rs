@@ -440,6 +440,7 @@ fn relabel(mut g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
 struct RadixHeap {
     last: u32,
     len: usize,
+    full: u64, // bit i: bucket i is not empty
     buckets: Vec<Vec<(u32, u32)>>,
 }
 
@@ -448,6 +449,7 @@ impl RadixHeap {
         RadixHeap {
             last: 0,
             len: 0,
+            full: 0,
             buckets: vec![Vec::new(); 33],
         }
     }
@@ -455,17 +457,25 @@ impl RadixHeap {
     #[inline(always)]
     fn push(&mut self, key: u32, v: u32) {
         self.len += 1;
-        self.buckets[32 - (key ^ self.last).leading_zeros() as usize].push((key, v));
+        let i = 32 - (key ^ self.last).leading_zeros() as usize;
+        self.full |= 1 << i;
+        self.buckets[i].push((key, v));
     }
 
     /// The smallest key, or None when empty. Bucket 0 holds only keys equal to `last`.
     fn min(&mut self) -> Option<u32> {
-        if self.buckets[0].is_empty() {
-            let i = (1..33).find(|&i| !self.buckets[i].is_empty())?;
+        if self.full & 1 == 0 {
+            if self.full == 0 {
+                return None;
+            }
+            let i = self.full.trailing_zeros() as usize;
+            self.full &= !(1 << i);
             let mut items = std::mem::take(&mut self.buckets[i]);
             self.last = items.iter().map(|e| e.0).min().unwrap();
             for &(key, v) in &items {
-                self.buckets[32 - (key ^ self.last).leading_zeros() as usize].push((key, v));
+                let j = 32 - (key ^ self.last).leading_zeros() as usize;
+                self.full |= 1 << j;
+                self.buckets[j].push((key, v));
             }
             items.clear();
             self.buckets[i] = items; // keep the capacity
@@ -476,25 +486,37 @@ impl RadixHeap {
     fn pop(&mut self) -> Option<(u32, u32)> {
         self.min()?;
         self.len -= 1;
-        self.buckets[0].pop()
+        let top = self.buckets[0].pop();
+        if self.buckets[0].is_empty() {
+            self.full &= !1;
+        }
+        top
     }
 
     fn clear(&mut self) {
         self.buckets.iter_mut().for_each(Vec::clear);
         self.last = 0;
         self.len = 0;
+        self.full = 0;
     }
 }
 
 /// The edges a search follows from `u`, as (other end, weight), passed to `f`.
 trait Adj {
     fn each(&self, u: u32, f: impl FnMut(u32, u64));
+    /// Starts loading what `each(u)` will read.
+    fn hint(&self, u: u32);
 }
 
 impl Adj for Graph {
     #[inline(always)]
     fn each(&self, u: u32, mut f: impl FnMut(u32, u64)) {
         self.edges(u).for_each(|(v, w)| f(v, w));
+    }
+
+    #[inline(always)]
+    fn hint(&self, u: u32) {
+        prefetch(self.adj.as_ptr().wrapping_add(self.off[u as usize] as usize));
     }
 }
 
@@ -561,6 +583,13 @@ impl<'a> Back<'a> {
 }
 
 impl Adj for Back<'_> {
+    #[inline(always)]
+    fn hint(&self, u: u32) {
+        let a = self.g.off[u as usize] as usize;
+        prefetch(self.g.adj.as_ptr().wrapping_add(a));
+        prefetch(self.rw.as_ptr().wrapping_add(a));
+    }
+
     #[inline(always)]
     fn each(&self, x: u32, mut f: impl FnMut(u32, u64)) {
         let g = self.g;
@@ -655,6 +684,10 @@ impl Side {
     /// node the other side has labelled is a complete s-t path; `best` keeps the shortest.
     fn step(&mut self, g: &impl Adj, other: &Side, best: &mut u64, wide: &mut bool) {
         let (d, u) = self.heap.pop().unwrap();
+        // The next node to settle is usually already known: start loading its edges.
+        if let Some(&(_, next)) = self.heap.buckets[0].last() {
+            g.hint(next);
+        }
         let d = u64::from(d);
         if d + 1 > u64::from(self.dist(u)) {
             return; // stale entry
@@ -756,26 +789,29 @@ fn main() {
     let g = relabel(graph, &mut queries, threads);
     let rev = Back::new(&g, threads);
 
-    // Queries sorted by source and handed out one at a time: the threads then all work in
-    // one moving part of the renumbered map, which the shared cache holds, and no thread is
-    // left finishing a run of long searches alone. Answers: i64, -1 unreachable.
+    // Queries sorted by source and handed out four at a time: the threads then all work in
+    // one moving part of the renumbered map, which the shared cache holds, and short runs
+    // keep a few long searches from leaving one thread last. Answers: i64, -1 unreachable.
     let mut by_source: Vec<usize> = (0..queries.len()).collect();
     by_source.sort_unstable_by_key(|&q| queries[q].0);
+    let runs: Vec<&[usize]> = by_source.chunks(4).collect();
     let answers: Vec<AtomicI64> = queries.iter().map(|_| AtomicI64::new(-1)).collect();
     let (next, n) = (AtomicUsize::new(0), g.off.len() - 1);
     par_map(vec![(); threads], |()| {
         let mut sides: Option<(Side, Side)> = None;
-        while let Some(&q) = by_source.get(next.fetch_add(1, Relaxed)) {
-            let (s, t) = queries[q];
-            let answer = if s == t {
-                Some(0)
-            } else if g.off[s as usize] == g.off[s as usize + 1] || !rev.has_in(t) {
-                None // no way out of s, or no way into t
-            } else {
-                let sides = sides.get_or_insert_with(|| (Side::new(n), Side::new(n)));
-                shortest(&g, &rev, sides, s, t).unwrap_or_else(|| shortest_wide(&g, s, t))
-            };
-            answers[q].store(answer.map_or(-1, |d| d as i64), Relaxed);
+        while let Some(run) = runs.get(next.fetch_add(1, Relaxed)) {
+            for &q in *run {
+                let (s, t) = queries[q];
+                let answer = if s == t {
+                    Some(0)
+                } else if g.off[s as usize] == g.off[s as usize + 1] || !rev.has_in(t) {
+                    None // no way out of s, or no way into t
+                } else {
+                    let sides = sides.get_or_insert_with(|| (Side::new(n), Side::new(n)));
+                    shortest(&g, &rev, sides, s, t).unwrap_or_else(|| shortest_wide(&g, s, t))
+                };
+                answers[q].store(answer.map_or(-1, |d| d as i64), Relaxed);
+            }
         }
     });
 
@@ -787,4 +823,6 @@ fn main() {
     File::create(format!("{out_dir}/distances.txt"))
         .and_then(|mut f| f.write_all(&out))
         .expect("write distances.txt");
+    // Leave without freeing the graphs: the kernel reclaims them faster at exit.
+    std::process::exit(0);
 }
