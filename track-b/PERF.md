@@ -7,7 +7,8 @@ Every step from the reference to the final version, each with the live-board run
 | 0 | The reference, unchanged (scoring-box calibration) | | 56.35 | 2200 | 91 | 1 | 0 |
 | 1 | Rust: query-term-only index, Aho-Corasick phrases, SIMD tokenizer, batch bitmaps | `e8571e5` | 0.469 | 132 | 613 | 14.46 | 58.008 |
 | 2 | Compact per-thread answers, packed pairs, filtered term lookup, CSR automaton | _fill in_ | | | | | |
-| 3 | Smaller source: the same logic in fewer lines | _fill in_ | | | | | |
+| 3 | Smaller source: the same logic in fewer lines | `7c515ca` | 0.472 | 94 | 580 | 15.55 | 59.588 |
+| 4 | Fixed 128 KiB mmap threshold | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -60,3 +61,9 @@ Source size is 15% of the exponent, and this file was 621 code lines against the
 `par_map` for the worker threads. BOOL evaluation has one path: each operand becomes a 64-word bitmap (a precomputed one for a dense term, a scratch one built from the list otherwise), then one word-wise OR, AND or NOT. `class_mask` has one fallback that covers both the file's last block and builds without AVX2, and the 256-entry token table it used became `is_ascii_alphanumeric()`, which is exactly spec 2.2's token byte.
 
 621 to 571 code lines. Run time unchanged in alternating runs against the previous build. Correctness: identical SHA-256 to the reference on the full seed battery, the worked example, and with 1, 3 and 13 threads.
+
+## Step 4: allocator threshold
+
+Board, step 3: 630 to 580 lines with T within run-to-run noise (one run per push), so the score stayed level.
+
+glibc raises its mmap threshold each time a large mmapped block is freed. Large blocks after that come from per-thread arenas, which keep their pages after a free. With `mallopt(M_MMAP_THRESHOLD, 128 KiB)` at start, as in Track D, every large block keeps its own mmap and is returned when freed. Local memory cgroup at 12 threads: 89 MB to 76 MB, time unchanged. Correctness: identical SHA-256 on tiny seeds 1 to 25, sample seeds 1 to 6, full seeds 1 and 5, the worked example, and with 1, 3 and 13 threads.

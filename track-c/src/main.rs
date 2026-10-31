@@ -18,6 +18,7 @@ use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 /// Maps a whole file read-only. The harness pre-warms /data into the page cache.
@@ -434,6 +435,11 @@ fn main() {
     let data_dir = args.get(1).map_or("/data", String::as_str);
     let out_dir = args.get(2).map_or("/out", String::as_str);
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
+    // Serve every allocation of 128 KiB or more with its own mmap (M_MMAP_THRESHOLD = -3).
+    // Left to itself, glibc raises that threshold each time such a block is freed, after
+    // which large blocks come from per-thread arenas that keep their pages when freed.
+    // SAFETY: mallopt only tunes the allocator; it is called before any thread starts.
+    unsafe { mallopt(-3, 128 * 1024) };
 
     // regions.csv: "region_id,country" lines after a header, ids ascending, codes [A-Z]{3}.
     // A code's base-26 key sorts like the code itself, so walking the 26^3 table in key
@@ -486,10 +492,9 @@ fn main() {
     // and room for every record to bring a long name, of which only used pages are touched.
     let mut slot_mem = vec![0u64; 4 << 18];
     let mut long_mem = vec![0u64; body.len() / 2 + 1024];
-    // Per-country name bitmaps. Ids are below the slot count, so a row of 2^18 bits always
-    // fits; the storage is zero-allocated, so only the pages under used ids are committed.
-    let stride = slot_mem.len() / 4 / 64;
-    let mut seen = vec![0u64; groups * stride];
+    // Per-country name bitmaps, each grown to the ids handed out so far when it is folded:
+    // no row is sized for ids that never come.
+    let mut seen: Vec<Vec<u64>> = vec![Vec::new(); groups];
     let names = Names {
         slots: atomics(&mut slot_mem),
         long: atomics(&mut long_mem),
@@ -506,20 +511,23 @@ fn main() {
     for round in split_records(body, threads * ROUNDS).chunks(threads) {
         let jobs: Vec<_> = round.iter().zip(states).collect();
         states = par_map(jobs, |(chunk, st)| parse(chunk, country_of, names, st));
-        let rows = Mutex::new(seen.chunks_mut(stride).enumerate());
+        let (rows, words) = (
+            Mutex::new(seen.iter_mut().enumerate()),
+            names.ids.load(Relaxed) / 64 + 1,
+        );
         par_map(vec![(); threads], |()| loop {
             let Some((g, row)) = rows.lock().unwrap().next() else {
                 break;
             };
+            row.resize(words, 0);
             for &id in states.iter().flat_map(|st| &st.1[g]) {
                 row[id as usize / 64] |= 1 << (id % 64);
             }
         });
     }
-    let words = names.ids.load(Relaxed).div_ceil(64);
     let distinct: Vec<u32> = seen
-        .chunks(stride)
-        .map(|row| row[..words].iter().map(|w| w.count_ones()).sum())
+        .iter()
+        .map(|row| row.iter().map(|w| w.count_ones()).sum())
         .collect();
     let mut text = String::new();
     for g in 0..groups {

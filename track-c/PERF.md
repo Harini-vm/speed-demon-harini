@@ -9,7 +9,8 @@ Every step from the reference to the final version, each with the live-board run
 | 2 | Country marks moved out of the shared table into private per-thread lists; regions read with plain iterators | `5e6ffc1` | 0.082 | 41 | 411 | 16.83 | 61.302 |
 | 3 | Smaller source: the same logic in fewer lines | _fill in_ | | | | | |
 | 4 | Name ids folded into per-country bitmaps after each of four parse rounds; one-line name slots | `9157dea` | 0.064 | 47 | 416 | 18.57 | 63.442 |
-| 5 | regions.csv parsed in parallel in one pass; name slots prefetched four records ahead | _fill in_ | | | | | |
+| 5 | regions.csv parsed in parallel in one pass; name slots prefetched four records ahead | `7c515ca` | 0.067 | 47 | 444 | 17.90 | 62.638 |
+| 6 | Fixed 128 KiB mmap threshold; name bitmaps grown to the ids in use | _fill in_ | | | | | |
 
 ## Step 1, built in measured stages (local, 2 threads)
 
@@ -84,3 +85,12 @@ Board, step 4: T 78 to 64 ms. M went from 41 to 47 MB on the board, while this m
 Local, 2 threads: about 205 to 200 ms (min of 9, alternating). Most of the gain is the serial regions step, which this machine's two threads hide and the box's twelve do not.
 
 435 code lines. Correctness: identical SHA-256 to the reference on tiny seeds 1 to 25, sample seeds 1 to 6, full seeds 1 and 13, the worked example, a file without a final terminator, a header-only file, a one-record file, the long-name file, with 1, 3, 13 and 52 threads, and with a build without AVX2.
+
+## Step 6: memory
+
+Board, step 5: T 64 to 67 ms, within one run's noise, and M again 47 MB against 20 MB in a local memory cgroup. The top teams run this track in 9 to 14 MB.
+
+- **`mallopt(M_MMAP_THRESHOLD, 128 KiB)`, as in Track D.** It stops glibc from moving large blocks into arenas that keep their pages after a free.
+- **Name bitmaps sized to use.** They were one zero-allocated block of 2^18 bits per country (7.9 MB of address space, about 3 MB touched). Each country's row is now a vector, grown at each fold to the ids handed out so far: about 12.6 KB per country at full scale. No fixed bound on the number of distinct names is assumed, so a dataset with more names than the generator's pool still runs.
+
+Local: 21 MB peak at 12 threads, time unchanged. This step tests what the box charges that this machine does not. Correctness: identical SHA-256 on tiny seeds 1 to 25, sample seeds 1 to 6, full seeds 1 and 13, the worked example, the edge-case files (no final terminator, header only, one record, long names), and with 1, 3 and 13 threads.

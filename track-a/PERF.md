@@ -10,7 +10,8 @@ Every step from the reference to the final version, each with the live-board run
 | 3 | The serial steps between phases made parallel | `5c2e2da` | 0.043 | 54 | 407 | 27.06 | 71.618 |
 | 4 | Smaller source: the same logic in fewer lines | (shipped with step 5) | | | | | |
 | 5 | 6 bytes per line instead of 8, u32 cell counts, linear merge of endpoint names | (shipped with step 6) | | | | | |
-| 6 | Field ends from a 64-byte space/LF bitmask | _fill in_ | | | | | |
+| 6 | Field ends from a 64-byte space/LF bitmask | `7c515ca` | 0.042 | 54 | 393 | 27.66 | 72.092 |
+| 7 | Fixed 128 KiB mmap threshold; cell table sized to the spec's 72 hours | _fill in_ | | | | | |
 
 ## Step 1
 
@@ -99,3 +100,12 @@ Tried and measured:
 - **MAP_POPULATE on the input.** Moves about 4 ms of page faults from the parse into a single-threaded mmap, so no gain.
 
 384 code lines. Correctness: identical SHA-256 to the reference on tiny seeds 1 to 12, sample seeds 1 to 7, full seeds 1 and 42, the worked example, an empty input, with 1, 3, 7 and 13 threads, and with a build without AVX2.
+
+## Step 7: memory the box charges and this machine did not
+
+Board, step 6: T 43 to 42 ms and M unchanged at 54 MB. A local memory cgroup measured 45 MB for the same build, and the top five teams run this track in 17 to 20 MB. Track D, the only track that already set the option below, measures within 7 MB of the board.
+
+- **`mallopt(M_MMAP_THRESHOLD, 128 KiB)`, as in Track D.** glibc raises its mmap threshold every time a large mmapped block is freed. Large blocks after that come from per-thread arenas, which keep their pages after a free. A fixed threshold keeps every block of 128 KiB or more on its own mmap, so freeing it returns the memory.
+- **`HOUR_CAP` 256 to 72.** The spec fixes the span at exactly 72 hours for every seed and scale, and the existing assert stops the run on a timestamp outside it. Each thread's zero-allocated cell table goes from 2 MiB of address space to 576 KiB. Only touched pages were committed here, but a smaller range leaves nothing for the kernel to back with 2 MB pages on a box that uses them.
+
+Local cgroup peak at 12 threads: 45 MB to 34 MB. Time unchanged (min of 9, alternating). Correctness: identical SHA-256 to the reference on tiny seeds 1 to 12, sample seeds 1 to 7, full seeds 1 and 42, the worked example, an empty input, and with 1, 3 and 13 threads.

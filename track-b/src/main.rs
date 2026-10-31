@@ -19,6 +19,7 @@ use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 /// Maps a whole file read-only. The harness pre-warms /data into the page cache.
@@ -579,6 +580,11 @@ fn main() {
     let data_dir = args.get(1).map_or("/data", String::as_str);
     let out_dir = args.get(2).map_or("/out", String::as_str);
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
+    // Serve every allocation of 128 KiB or more with its own mmap (M_MMAP_THRESHOLD = -3).
+    // Left to itself, glibc raises that threshold each time such a block is freed, after
+    // which large blocks come from per-thread arenas that keep their pages when freed.
+    // SAFETY: mallopt only tunes the allocator; it is called before any thread starts.
+    unsafe { mallopt(-3, 128 * 1024) };
 
     // Queries: intern every term; give BOOL terms a dense index; number distinct phrases.
     let qtext = map(&format!("{data_dir}/queries.txt"));

@@ -20,12 +20,14 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::thread;
 
 /// A thread's cell for (hour, local endpoint id) is `hour * EP_CAP + id`. The spec fixes the
-/// catalogue at 1,842 endpoints and the span at 72 hours, both well inside these caps.
+/// catalogue at 1,842 endpoints and the span at exactly 72 hours for every seed and scale;
+/// a timestamp outside it stops the run with an error instead of being miscounted.
 const EP_CAP: usize = 2048;
-const HOUR_CAP: usize = 256;
+const HOUR_CAP: usize = 72;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
@@ -302,6 +304,11 @@ fn main() {
         std::slice::from_raw_parts(ptr, len)
     };
     let threads = thread::available_parallelism().map_or(1, |n| n.get());
+    // Serve every allocation of 128 KiB or more with its own mmap (M_MMAP_THRESHOLD = -3).
+    // Left to itself, glibc raises that threshold each time such a block is freed, after
+    // which large blocks come from per-thread arenas that keep their pages when freed.
+    // SAFETY: mallopt only tunes the allocator; it is called before any thread starts.
+    unsafe { mallopt(-3, 128 * 1024) };
     let base_hour = days_from_civil(2026, 10, 30) * 24 + 18;
 
     // 1. Parse in parallel.
