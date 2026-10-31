@@ -183,6 +183,12 @@ struct Graph {
 }
 
 impl Graph {
+    /// The real weight of an edge from `u` to `v` stored as `w`.
+    #[inline(always)]
+    fn weight(&self, w: u16, u: u32, v: u32) -> u64 {
+        if w != BIG { u64::from(w) } else { self.big_weight(u, v) }
+    }
+
     /// A stored weight of BIG from `u` to `v`: the smallest such edge's real weight
     /// (parallel edges may share the pair; any of their weights is a real edge).
     #[cold]
@@ -376,7 +382,7 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
     for (order, list, ends) in parts {
         let next = (base.0 + order.len(), base.1 + list.len());
         jobs.push((order, ends, base));
-        lists.push(list);
+        lists.push((list, base.1));
         base = next;
     }
     par_map(jobs, |(order, ends, (k0, e0))| {
@@ -387,16 +393,11 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
     });
     // Each thread's lists go to their place, their heads given new ids on the way.
     let id = |x: u32| new_id[x as usize];
-    let mut adj = zeroed::<Edge>(lists.iter().map(Vec::len).sum());
-    let mut rest: &mut [Edge] = &mut adj;
-    let mut jobs = Vec::new();
-    for list in lists {
-        let (mine, tail) = std::mem::take(&mut rest).split_at_mut(list.len());
-        rest = tail;
-        jobs.push((mine, list));
-    }
-    par_map(jobs, |(mine, list)| {
-        mine.iter_mut().zip(&list).for_each(|(d, &e)| *d = Edge { v: id(e.v), w: e.w });
+    let mut adj = zeroed::<Edge>(base.1);
+    let adjp = SharedPtr(adj.as_mut_ptr());
+    par_map(lists, |(list, e0)| {
+        let new = |(k, e): (usize, &Edge)| adjp.set(e0 + k, Edge { v: id(e.v), w: e.w });
+        list.iter().enumerate().for_each(new); // this thread's own range of edges
     });
     let mut big: Vec<_> = big.iter().map(|&(u, v, w)| (id(u), id(v), w)).collect();
     big.sort_unstable();
@@ -428,6 +429,11 @@ impl RadixHeap {
     #[inline(always)]
     fn push(&mut self, key: u32, v: u32) {
         self.len += 1;
+        self.put(key, v);
+    }
+
+    #[inline(always)]
+    fn put(&mut self, key: u32, v: u32) {
         let i = 32 - (key ^ self.last).leading_zeros() as usize;
         self.full |= 1 << i;
         self.buckets[i].push((key, v));
@@ -443,11 +449,7 @@ impl RadixHeap {
             self.full &= !(1 << i);
             let mut items = std::mem::take(&mut self.buckets[i]);
             self.last = items.iter().map(|e| e.0).min().unwrap();
-            for &(key, v) in &items {
-                let j = 32 - (key ^ self.last).leading_zeros() as usize;
-                self.full |= 1 << j;
-                self.buckets[j].push((key, v));
-            }
+            items.iter().for_each(|&(key, v)| self.put(key, v));
             items.clear();
             self.buckets[i] = items; // keep the capacity
         }
@@ -519,8 +521,7 @@ impl Back {
                     back.iter().for_each(|e| rev = if e.v == x as u32 { rev.min(e.w) } else { rev });
                     dst.set(j, Edge8 { v: y, w, rw: rev }); // edge j is in this thread's range
                     if rev == ABSENT {
-                        let w = if w != BIG { u64::from(w) } else { g.big_weight(x as u32, y) };
-                        extra.push((y, x as u32, w as u32));
+                        extra.push((y, x as u32, g.weight(w, x as u32, y) as u32));
                     }
                 }
             }
@@ -566,7 +567,7 @@ impl Adj for Fwd<'_> {
     #[inline(always)]
     fn each(&self, x: u32, mut f: impl FnMut(u32, u64)) {
         for e in self.0.list(x) {
-            f(e.v, if e.w != BIG { u64::from(e.w) } else { self.0.g.big_weight(x, e.v) });
+            f(e.v, self.0.g.weight(e.w, x, e.v));
         }
     }
 }
@@ -582,7 +583,7 @@ impl Adj for Back {
     fn each(&self, x: u32, mut f: impl FnMut(u32, u64)) {
         for e in self.list(x) {
             if e.rw != ABSENT {
-                f(e.v, if e.rw != BIG { u64::from(e.rw) } else { self.g.big_weight(e.v, x) });
+                f(e.v, self.g.weight(e.rw, e.v, x));
             }
         }
         if self.has_extra[x as usize / 64] >> (x % 64) & 1 != 0 {
@@ -604,14 +605,14 @@ const PAGE: usize = 1 << PAGE_BITS;
 /// One direction of a search. `dist` holds distance + 1, with 0 for "not reached", in pages
 /// handed out on first write: `table[v >> PAGE_BITS]` is the page's place in `pages`, and
 /// page 0 is all zeros, standing in for every page not yet handed out. After the BFS
-/// renumbering a search touches few pages, so the pool stays small, and resetting the
-/// touched entries leaves every page zeroed for the next query. u32 distances: one that
+/// renumbering a search touches few pages, so the pool stays small; a reset zeroes the
+/// pages handed out and their `table` entries (`owners`). u32 distances: one that
 /// would not fit sets `wide`, and the query is re-run by `shortest_wide`.
 struct Side {
     table: Vec<u32>,
     pages: Vec<u32>,
     used: usize,
-    touched: Vec<u32>,
+    owners: Vec<usize>, // the table entries of the pages handed out
     heap: RadixHeap,
 }
 
@@ -621,7 +622,7 @@ impl Side {
             table: vec![0; (n >> PAGE_BITS) + 1],
             pages: vec![0; PAGE],
             used: 1,
-            touched: Vec::new(),
+            owners: Vec::new(),
             heap: RadixHeap::new(),
         }
     }
@@ -639,6 +640,7 @@ impl Side {
         if *page == 0 {
             *page = self.used as u32;
             self.used += 1;
+            self.owners.push(v >> PAGE_BITS);
             if self.pages.len() < self.used << PAGE_BITS {
                 self.pages.resize(self.used << PAGE_BITS, 0);
             }
@@ -648,19 +650,12 @@ impl Side {
 
     fn start(&mut self, x: u32) {
         *self.slot(x) = 1;
-        self.touched.push(x);
         self.heap.push(0, x);
     }
 
     fn reset(&mut self) {
-        for &v in &self.touched {
-            let page = self.table[v as usize >> PAGE_BITS] as usize;
-            self.pages[page << PAGE_BITS | (v as usize & (PAGE - 1))] = 0;
-        }
-        for &v in &self.touched {
-            self.table[v as usize >> PAGE_BITS] = 0;
-        }
-        self.touched.clear();
+        self.pages[PAGE..self.used << PAGE_BITS].fill(0);
+        self.owners.drain(..).for_each(|b| self.table[b] = 0);
         self.heap.clear();
         self.used = 1;
     }
@@ -691,11 +686,7 @@ impl Side {
             }
             let dv = self.slot(v);
             if *dv == 0 || nd + 1 < u64::from(*dv) {
-                let new = *dv == 0;
                 *dv = nd as u32 + 1;
-                if new {
-                    self.touched.push(v);
-                }
                 self.heap.push(nd as u32, v);
             }
         });

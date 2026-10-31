@@ -151,3 +151,44 @@ Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample se
 ## Step 13: one query at a time
 
 Queries were handed out in runs of four, sorted by source. A simulation of 12 workers over each query's measured work (heap pops) puts the last thread's finish 8.8% after an even split with runs of four, and 4.8% with single queries. The searches stay sorted by source, so the threads still work in one moving part of the map.
+
+Board, step 13: 201.6 ms against 183.4 for step 12, in one run each. A box A/B of the two (alternating pushes of the same code with runs of four and runs of one, 184.7, 181.8 and 183.3 ms) showed no difference, so the queries are handed out in runs of four again.
+
+## What the box measures and this machine does not
+
+This machine has a 260 MB L3 cache; the box (i5-13500) has 24 MB. Every array of this track fits in cache here, so a local run never shows what a cache miss to DRAM costs, and changes to memory layout cannot be judged locally. Phase times on the box were measured with builds that stop after a phase, and one build that exits with a phase's duration in milliseconds as its exit code, which the board reports for a failed run: parse and CSR 34 ms, BFS 21 ms, copy 19 ms, reverse weights 17 ms, queries about 80 ms. Single board runs of the same code vary by up to 13% (173.8 and 196.9 ms), so variants are compared over several alternating pushes.
+
+## Step 14: faster parsing and heap
+
+- **Separators by bitmask.** As in Track A, each 64-byte block gives a bitmask of its spaces and LFs (AVX2 compares), and every number ends at the next set bit; the last eight digits are converted at once (SWAR). Local parse phase, 2 threads: 49.5 to 43 ms.
+- **Radix heap with a bitmask of non-empty buckets.** Refilling bucket 0 looked for the lowest non-empty bucket by checking up to 32 bucket headers, 12 cache lines. A 64-bit mask finds it with one trailing-zero count. Callgrind, sample scale: 627 to 562 million instructions. Local queries, 2 threads: 321 to about 295 ms.
+- **No frees at exit.** The program exits right after writing its answers, so the graphs are not freed one by one before the kernel tears the process down anyway.
+
+## Step 15: prefetching the next node to settle
+
+After a pop, the node the search will settle next is usually already known: the last entry of bucket 0 (76% of pops), or else the last entry of the lowest non-empty bucket. The search now starts loading that node's edges (and reverse weights) while it relaxes the current node's. Even with everything in cache here, local wall time fell about 7% (median 563 to 525 ms).
+
+Tried and not kept:
+
+- **Pruning labels** with `nd + other side's smallest key >= best`: 6% fewer heap pushes, the same number of settled nodes.
+- **Choosing the side by labelled nodes** instead of queued entries, or with a 4:5 bias: more pops in every case.
+- **Plain distance arrays** instead of the page pool: queries 311 to 380 ms. Page sizes of 2^6 to 2^9 nodes: no difference.
+- **Building the graph twice** (once for the renumbering, then again from the text in the new ids, with no copy): local peak 78 to 61 MB, but on the box 191.9 ms and 73.7 MiB against 173.8 ms and 80.8 MiB.
+- **Writing the new graph during the BFS into shared blocks**: the threads' blocks interleave in memory, which cost the queries more than the copy it saved.
+
+## Step 16: one array for both directions, and the copy taken out of the renumbering
+
+- **8-byte query edges.** The backward search read each node's list from the edge array and its reverse weights from a second array: two cache lines, often from DRAM on the box. Each edge is now (head, weight, reverse weight) in 8 bytes, so both directions read one entry. The reverse-weight pass writes this array directly from the 6-byte graph, which is freed right after, so the peak does not grow.
+- **No copy in the renumbering.** The BFS already reads every node's list in the new order, so each thread now appends the lists it visits to its own buffer, with each list's end. The old graph is freed right after the BFS, the new ids and offsets come from the threads' orders and list ends, and each buffer is copied to its place with its heads renumbered: a sequential copy instead of one random read per node.
+
+Box A/B (alternating pushes): step 15 174.8 and 174.9 ms; with the buffers alone 178.6 and 175.2 ms; with both changes 158.5, 154.5 and 158.8 ms, M 82.5 MiB. The 8-byte entries are what the box rewards: this machine, with its large cache, measured them slightly slower.
+
+Box phase times (exit-code builds): the reverse-weight pass takes 17 ms, and everything before the queries 82 ms, so the queries are about 75 ms. A two-stage prefetch in the reverse-weight pass measured 22 ms there, so it is not used.
+
+Also tried on the box: lists of up to four edges in fixed slots per node, so that no offset array is read (97.3% of nodes have at most four out-edges; longer lists in a side array). 168 ms and 108 MiB: the 56 MB slot array costs more than the offset array saved.
+
+## Step 17: smaller source
+
+The search's reset zeroes the pages it handed out and their table entries, instead of every labelled node one by one, which also takes a push out of the relaxation loop. Edge weights are decoded by one helper, and the radix heap's refill reuses `push`'s bucket choice. 670 to 642 code lines after rustfmt, the same local time.
+
+Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example, and with 1, 3 and 13 threads in a build without AVX2.
