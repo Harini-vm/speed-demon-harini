@@ -143,3 +143,5 @@ Board, step 13: 69 ms, slower, with the other tracks' runs normal in the same pu
 ## Experiment: profile-guided optimisation
 
 The build runs an instrumented binary once on generator output and compiles the release binary with that profile. The training input in `pgo/` is the public generator's sample scale with seed 2 (the board uses seed 1); the image is the allowlisted `halloumee/speed-demon-rust`, whose `llvm-profdata` matches rustc 1.99.1. The source is unchanged. Kept only if the board measures it faster.
+
+Board: 59.2 and 59.5 ms against 53 to 55 ms without a profile: slower. Reverted.

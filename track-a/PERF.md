@@ -138,3 +138,5 @@ Each line kept its latency (4 bytes) until the scatter copied it into its group,
 ## Experiment: profile-guided optimisation
 
 The build runs an instrumented binary once on generator output and compiles the release binary with that profile. The training input in `pgo/` is the public generator's sample scale with seed 2 (the board uses seed 1); the image is the allowlisted `halloumee/speed-demon-rust`, whose `llvm-profdata` matches rustc 1.99.1. The source is unchanged. Kept only if the board measures it faster.
+
+Board: 50.4 and 46.5 ms against 46 to 47.5 ms without a profile. No gain; reverted.
