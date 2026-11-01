@@ -212,3 +212,5 @@ Box, renumbering patch size (REGION): 32 nodes 152.4 ms, 64 nodes 152.5 ms, 128 
 The build now runs an instrumented binary once on generator output and compiles the release binary with that profile, so branch layout and inlining follow real runs. The training input in `pgo/` is the public generator's sample scale with seed 2 (the board uses seed 1), and the image is the allowlisted `halloumee/speed-demon-rust`, whose `llvm-profdata` matches rustc 1.99.1. The source is unchanged. This machine's toolchain (rustc 1.97, LLVM 22) cannot merge a profile with its LLVM 18 `llvm-profdata`, so the board's build is the first test.
 
 Board, step 19: the build worked, and the run measured 152.1 ms against 152.0 to 152.5 ms for the same source without a profile (and the Dockerfile's four extra lines count in S). This track's time is memory latency, which branch layout does not change. Reverted.
+
+Box, the final copy in pieces of 65,536 edges from a shared counter (the threads' BFS regions range from 110,000 to 181,000 nodes): 165.9 and 173.9 ms against 155.1 and 152.4 ms, and 82.4 MiB, since every buffer now lives until the whole copy ends. Not kept.
