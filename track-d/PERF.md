@@ -206,3 +206,7 @@ Box phase times for this step (each build exits with one phase's milliseconds as
 Also measured on the box, not kept: the queries on 6 threads instead of 12 (178.5 and 177.9 ms against 162.3 and 183.0), and a second prefetch for the node after next (152.6 and 184.7 ms: no difference within the noise).
 
 Box, renumbering patch size (REGION): 32 nodes 152.4 ms, 64 nodes 152.5 ms, 128 nodes 152.0 ms. No difference; it stays 64.
+
+## Step 19: profile-guided optimisation
+
+The build now runs an instrumented binary once on generator output and compiles the release binary with that profile, so branch layout and inlining follow real runs. The training input in `pgo/` is the public generator's sample scale with seed 2 (the board uses seed 1), and the image is the allowlisted `halloumee/speed-demon-rust`, whose `llvm-profdata` matches rustc 1.99.1. The source is unchanged. This machine's toolchain (rustc 1.97, LLVM 22) cannot merge a profile with its LLVM 18 `llvm-profdata`, so the board's build is the first test.
