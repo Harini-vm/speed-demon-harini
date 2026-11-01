@@ -214,3 +214,7 @@ The build now runs an instrumented binary once on generator output and compiles 
 Board, step 19: the build worked, and the run measured 152.1 ms against 152.0 to 152.5 ms for the same source without a profile (and the Dockerfile's four extra lines count in S). This track's time is memory latency, which branch layout does not change. Reverted.
 
 Box, the final copy in pieces of 65,536 edges from a shared counter (the threads' BFS regions range from 110,000 to 181,000 nodes): 165.9 and 173.9 ms against 155.1 and 152.4 ms, and 82.4 MiB, since every buffer now lives until the whole copy ends. Not kept.
+
+## Step 20: smaller source
+
+The same program in fewer lines after rustfmt: the big-weight lookup takes the first match (the list is sorted by tail, head and weight, so it is the lightest), the parse no longer goes through `edge` and `word`, the parse buckets are regrouped in one expression, and the answers are written with `fs::write`. 651 to 619 code lines; the same local time. Correctness: identical SHA-256 to the reference on tiny seeds 1 to 20, sample seeds 1 to 6, full seeds 1 and 9, the worked example and the 300-edge hub graph, with 1, 3 and 13 threads in a build without AVX2.

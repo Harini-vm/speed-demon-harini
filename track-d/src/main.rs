@@ -13,7 +13,6 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
-use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
@@ -55,11 +54,6 @@ fn number(buf: &[u8], i: &mut usize) -> u64 {
 
 const ONES: u64 = 0x0101_0101_0101_0101;
 
-#[inline(always)]
-fn word(buf: &[u8], i: usize) -> u64 {
-    u64::from_le_bytes(buf[i..i + 8].try_into().unwrap())
-}
-
 /// Bit k is set if `buf[at + k]` is a space or LF, the only bytes below `0`; 0 past the end.
 #[inline(always)]
 fn seps(buf: &[u8], at: usize) -> u64 {
@@ -78,7 +72,7 @@ fn seps(buf: &[u8], at: usize) -> u64 {
         };
     }
     // The last block of a chunk, or a build without AVX2.
-    buf[at..].iter().take(64).enumerate().fold(0, |m, (k, &c)| m | u64::from(c < b'0') << k)
+    (0..buf.len().min(at + 64) - at).fold(0, |m, k| m | u64::from(buf[at + k] < b'0') << k)
 }
 
 /// The decimal `buf[start..end]`: the last (up to) eight digits converted at once, as one
@@ -92,7 +86,7 @@ fn decimal(buf: &[u8], start: usize, end: usize) -> u64 {
     }
     let keep = (end - start).min(8);
     let mask = u64::MAX << (8 * (8 - keep));
-    let d = (word(buf, end - 8) & mask) - (ONES * u64::from(b'0') & mask);
+    let d = (u64::from_le_bytes(buf[end - 8..end].try_into().unwrap()) & mask) - (ONES * u64::from(b'0') & mask);
     let v = (d * 10 + (d >> 8)) & 0x00FF_00FF_00FF_00FF;
     let v = (v * 100 + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
     digits(&buf[start..end - keep]) * 100_000_000 + ((v * 10_000 + (v >> 32)) & 0xFFFF_FFFF)
@@ -103,12 +97,8 @@ fn split_lines(buf: &[u8], n: usize) -> Vec<&[u8]> {
     let mut cuts = vec![0];
     for i in 1..=n {
         let at = (buf.len() * i / n).max(*cuts.last().unwrap());
-        cuts.push(
-            buf[at..]
-                .iter()
-                .position(|&c| c == b'\n')
-                .map_or(buf.len(), |k| at + k + 1),
-        );
+        let lf = buf[at..].iter().position(|&c| c == b'\n');
+        cuts.push(lf.map_or(buf.len(), |k| at + k + 1));
     }
     cuts.windows(2).map(|w| &buf[w[0]..w[1]]).collect()
 }
@@ -167,13 +157,6 @@ fn zeroed<T: Copy>(n: usize) -> Vec<T> {
 const BIG: u16 = u16::MAX - 1;
 const ABSENT: u16 = u16::MAX;
 
-fn edge(v: u32, w: u32) -> Edge {
-    Edge {
-        v,
-        w: w.min(u32::from(BIG)) as u16,
-    }
-}
-
 /// The graph in CSR form: the edges of `u` are `adj[off[u]..off[u + 1]]`. `big` holds
 /// (u, v, weight) for every edge whose weight did not fit, sorted.
 struct Graph {
@@ -194,10 +177,7 @@ impl Graph {
     #[cold]
     fn big_weight(&self, u: u32, v: u32) -> u64 {
         let i = self.big.partition_point(|&(a, b, _)| (a, b) < (u, v));
-        let same = self.big[i..]
-            .iter()
-            .take_while(|&&(a, b, _)| (a, b) == (u, v));
-        u64::from(same.map(|e| e.2).min().unwrap())
+        u64::from(self.big[i].2) // sorted by (tail, head, weight): the first is the lightest
     }
 }
 
@@ -219,7 +199,7 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     // SAFETY: prctl only sets a flag of this process.
     unsafe { prctl(41, 1, 0, 0, 0) };
     let big = Mutex::new(Vec::new());
-    let parts = par_map(split_lines(&text[i..], threads), |chunk| {
+    let mut parts = par_map(split_lines(&text[i..], threads), |chunk| {
         // Every bucket gets its own capacity (`vec![v; nb]` would clone empty ones), about
         // 18 bytes of input per edge line: at full scale each is then above the mmap
         // threshold, so freeing it returns the memory instead of leaving it in this
@@ -239,9 +219,9 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
                 (start, field) = (end + 1, if field == 2 { 0 } else { field + 1 });
                 let [u, v, w] = x;
                 if field == 0 && u != v {
-                    let e = edge(v, w);
-                    buckets[(u >> SHIFT) as usize].push([u & 0xFFFF | u32::from(e.w) << 16, v]);
-                    if e.w == BIG {
+                    let ew = w.min(u32::from(BIG)) as u16;
+                    buckets[(u >> SHIFT) as usize].push([u & 0xFFFF | u32::from(ew) << 16, v]);
+                    if ew == BIG {
                         big.lock().unwrap().push((u, v, w)); // about 50 edges at full scale
                     }
                 }
@@ -257,14 +237,8 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
         base[b + 1] = base[b] + parts.iter().map(|p| p[b].len()).sum::<usize>();
     }
     // Regroup by bucket, so each bucket's lists can be freed as soon as it is built.
-    let mut by_bucket: Vec<Vec<Vec<[u32; 2]>>> = (0..nb).map(|_| Vec::new()).collect();
-    for part in parts {
-        by_bucket
-            .iter_mut()
-            .zip(part)
-            .for_each(|(b, list)| b.push(list));
-    }
-    let by_bucket: Vec<Mutex<Vec<Vec<[u32; 2]>>>> = by_bucket.into_iter().map(Mutex::new).collect();
+    let take = |b| Mutex::new(parts.iter_mut().map(|p| std::mem::take(&mut p[b])).collect());
+    let by_bucket: Vec<Mutex<Vec<Vec<[u32; 2]>>>> = (0..nb).map(take).collect();
 
     // Counting sort, one bucket at a time: its degree counts fit in L1, and each bucket owns
     // a disjoint range of `off` and of `adj`, so no atomics are needed.
@@ -275,11 +249,8 @@ fn build_graph(text: &[u8], threads: usize) -> Graph {
     let next = AtomicUsize::new(0);
     par_map(vec![(); threads], |()| {
         let mut cursor = vec![0u32; 1 << SHIFT];
-        loop {
-            let b = next.fetch_add(1, Relaxed);
-            if b >= nb {
-                break;
-            }
+        let tasks = std::iter::from_fn(|| Some(next.fetch_add(1, Relaxed)));
+        for b in tasks.take_while(|&b| b < nb) {
             let lists = std::mem::take(&mut *by_bucket[b].lock().unwrap());
             let (lo, edges) = (b << SHIFT, || lists.iter().flatten());
             cursor.fill(0);
@@ -393,7 +364,7 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
         let mut long = long.into_iter();
         for (k, (&u, &d)) in order.iter().zip(&degs).enumerate() {
             idp.set(u as usize, (k0 + k) as u32); // each node is in one order only
-            end += if d < 255 { usize::from(d) } else { long.next().unwrap() };
+            end += if d < 255 { d.into() } else { long.next().unwrap() };
             offp.set(k0 + k + 1, end as u32);
         }
     });
@@ -415,6 +386,7 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
 /// Dijkstra. An entry sits in bucket `bits(key ^ last)`. Popping refills bucket 0 from the
 /// lowest non-empty bucket, and each entry moves down at most 32 times in total. Keys are
 /// u32: a search whose distances would leave u32 goes to `shortest_wide` instead.
+#[derive(Default)]
 struct RadixHeap {
     last: u32,
     len: usize,
@@ -424,12 +396,8 @@ struct RadixHeap {
 
 impl RadixHeap {
     fn new() -> Self {
-        RadixHeap {
-            last: 0,
-            len: 0,
-            full: 0,
-            buckets: vec![Vec::new(); 33],
-        }
+        let buckets = vec![Vec::new(); 33];
+        RadixHeap { buckets, ..Default::default() }
     }
 
     #[inline(always)]
@@ -474,9 +442,7 @@ impl RadixHeap {
 
     fn clear(&mut self) {
         self.buckets.iter_mut().for_each(Vec::clear);
-        self.last = 0;
-        self.len = 0;
-        self.full = 0;
+        (self.last, self.len, self.full) = (0, 0, 0);
     }
 }
 
@@ -582,7 +548,8 @@ impl Adj for Fwd<'_> {
 impl Adj for Back {
     #[inline(always)]
     fn hint(&self, u: u32) {
-        prefetch(self.adj.as_ptr().wrapping_add(self.g.off[u as usize] as usize));
+        let at = self.g.off[u as usize] as usize;
+        prefetch(self.adj.as_ptr().wrapping_add(at));
     }
 
     #[inline(always)]
@@ -644,8 +611,7 @@ impl Side {
         let v = v as usize;
         let page = &mut self.table[v >> PAGE_BITS];
         if *page == 0 {
-            *page = self.used as u32;
-            self.used += 1;
+            (*page, self.used) = (self.used as u32, self.used + 1);
             self.owners.push(v >> PAGE_BITS);
             if self.pages.len() < self.used << PAGE_BITS {
                 self.pages.resize(self.used << PAGE_BITS, 0);
@@ -800,14 +766,8 @@ fn main() {
         }
     });
 
-    let mut out = Vec::with_capacity(queries.len() * 8);
-    for a in &answers {
-        out.extend_from_slice(a.load(Relaxed).to_string().as_bytes());
-        out.push(b'\n');
-    }
-    File::create(format!("{out_dir}/distances.txt"))
-        .and_then(|mut f| f.write_all(&out))
-        .expect("write distances.txt");
+    let out: String = answers.iter().map(|a| format!("{}\n", a.load(Relaxed))).collect();
+    std::fs::write(format!("{out_dir}/distances.txt"), out).expect("write distances.txt");
     // Leave without freeing the graphs: the kernel reclaims them faster at exit.
     std::process::exit(0);
 }
