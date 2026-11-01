@@ -401,9 +401,14 @@ fn relabel(g: Graph, queries: &mut [(u32, u32)], threads: usize) -> Graph {
     let id = |x: u32| new_id[x as usize];
     let mut adj = zeroed::<Edge>(base.1);
     let adjp = SharedPtr(adj.as_mut_ptr());
-    par_map(lists, |(list, e0)| {
-        let new = |(k, e): (usize, &Edge)| adjp.set(e0 + k, Edge { v: id(e.v), w: e.w });
-        list.iter().enumerate().for_each(new); // this thread's own range of edges
+    // In pieces of 65,536 edges from a shared counter: the threads' regions differ in size.
+    let pieces: Vec<_> = lists.iter().flat_map(|(list, e0)| list.chunks(1 << 16).enumerate().map(move |(i, c)| (c, e0 + (i << 16)))).collect();
+    let next = AtomicUsize::new(0);
+    par_map(vec![(); threads], |()| {
+        while let Some(&(piece, e0)) = pieces.get(next.fetch_add(1, Relaxed)) {
+            let new = |(k, e): (usize, &Edge)| adjp.set(e0 + k, Edge { v: id(e.v), w: e.w });
+            piece.iter().enumerate().for_each(new); // each piece is one range of edges
+        }
     });
     let mut big: Vec<_> = big.iter().map(|&(u, v, w)| (id(u), id(v), w)).collect();
     big.sort_unstable();
