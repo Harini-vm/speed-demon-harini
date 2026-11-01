@@ -134,3 +134,7 @@ Board, step 9: 73.071. The same code measured 51 ms in the next push (`19aaf87`)
 ## Step 10 (experiment): latencies stored once
 
 Each line kept its latency (4 bytes) until the scatter copied it into its group, so all 3.1 million latencies existed twice at the peak. Now the parse keeps only the endpoint id with the 5xx flag (2 bytes per line). The scatter walks each thread's text again with the same separator bitmask, reads just the latency field, and writes it straight to its group. Local cgroup at 12 threads: 34 to 25 MB. But it costs a second pass over the text: about 20% slower locally (2 threads). This is pushed to measure on the box, where memory and page faults weigh more than here. It is kept only if the board agrees.
+
+## Experiment: profile-guided optimisation
+
+The build runs an instrumented binary once on generator output and compiles the release binary with that profile. The training input in `pgo/` is the public generator's sample scale with seed 2 (the board uses seed 1); the image is the allowlisted `halloumee/speed-demon-rust`, whose `llvm-profdata` matches rustc 1.99.1. The source is unchanged. Kept only if the board measures it faster.

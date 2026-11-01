@@ -139,3 +139,7 @@ Board, step 12: 62 ms, within one run's noise of 60, so the box did not show the
 The input is mapped with `MAP_POPULATE`, so the kernel maps every page in the `mmap` call, in one thread, before the parse starts. No memory is added: the pages are the page cache's, mapped read-only.
 
 Board, step 13: 69 ms, slower, with the other tracks' runs normal in the same push. Mapping 200 MB in one thread costs more than the threads' own faults did, so page faults on the input are not this track's bottleneck. Reverted.
+
+## Experiment: profile-guided optimisation
+
+The build runs an instrumented binary once on generator output and compiles the release binary with that profile. The training input in `pgo/` is the public generator's sample scale with seed 2 (the board uses seed 1); the image is the allowlisted `halloumee/speed-demon-rust`, whose `llvm-profdata` matches rustc 1.99.1. The source is unchanged. Kept only if the board measures it faster.
